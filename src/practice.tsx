@@ -1,6 +1,6 @@
 import { ArrowLeft, ArrowRight, Check, ChevronRight, CircleCheck, ExternalLink, ListChecks, PenLine, Plus, RotateCcw, Search, Sparkles, Target, X } from 'lucide-react';
 import { useState } from 'react';
-import { api, choiceText, questionLabel, sourceLabel, type Attempt, type Context, type Draft, type Grade, type Mistake, type QuestionData,
+import { api, choiceText, materialLabels, questionLabel, sourceLabel, studyChapters, type Attempt, type Context, type Draft, type Grade, type Mistake, type QuestionData,
   type QuestionKind, type SearchResult, type Source } from './model';
 import { Empty, ErrorBox, Heading, Loading, Modal, useAction, useResource } from './ui';
 
@@ -12,7 +12,7 @@ function SourcePill({ source }: { source: Source }) {
 }
 
 export function SearchPage({ ctx, initialChapter }: { ctx: Context; initialChapter?: string }) {
-  const first = ctx.data.chapters.find((chapter) => chapter.id === initialChapter) || ctx.data.chapters[0];
+  const first = ctx.data.chapters.find((chapter) => chapter.id === initialChapter) || studyChapters(ctx.data)[0];
   const queryFor = (id: string) => {
     const chapter = ctx.data.chapters.find((item) => item.id === id);
     const course = ctx.data.courses.find((item) => item.id === chapter?.course_id);
@@ -31,7 +31,7 @@ export function SearchPage({ ctx, initialChapter }: { ctx: Context; initialChapt
       }); }}>
         <label>收录章节<select value={chapterId} onChange={(event) => { setChapterId(event.target.value); setQuery(queryFor(event.target.value)); setResults(undefined); }}>
           {!ctx.data.chapters.length && <option value="">先从资料库导入章节</option>}{ctx.data.chapters.map((chapter) => <option key={chapter.id} value={chapter.id}>
-            {ctx.data.courses.find((course) => course.id === chapter.course_id)?.name} · {chapter.title}</option>)}
+            {ctx.data.courses.find((course) => course.id === chapter.course_id)?.name} · {chapter.title} · {materialLabels[chapter.material_category]}</option>)}
         </select></label>
         <label>搜索关键词<input value={query} maxLength={400} onChange={(event) => setQuery(event.target.value)} placeholder="证书 科目 章节 试题" required /></label>
         {!ctx.searchReady && <div className="callout">在 .env 配置 TAVILY_API_KEY 后即可联网搜索。已有网页链接也可以手动录入。</div>}
@@ -172,7 +172,7 @@ export function MistakesPage({ ctx }: { ctx: Context }) {
       <RotateCcw size={16} />{items.length > 100 ? '重练前 100 题' : '重练当前列表'}</button>} />
     <section className="card panel"><div className="filter-grid">
       <label>科目<select value={course} onChange={(event) => { setCourse(event.target.value); setChapter(''); }}><option value="">全部科目</option>{ctx.data.courses.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-      <label>章节<select value={chapter} onChange={(event) => setChapter(event.target.value)}><option value="">全部章节</option>{ctx.data.chapters.filter((item) => !course || item.course_id === course).map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
+      <label>章节<select value={chapter} onChange={(event) => setChapter(event.target.value)}><option value="">全部章节</option>{ctx.data.chapters.filter((item) => !course || item.course_id === course).map((item) => <option key={item.id} value={item.id}>{item.title} · {materialLabels[item.material_category]}</option>)}</select></label>
       <label>掌握状态<select value={status} onChange={(event) => setStatus(event.target.value)}><option value="pending">待复习</option><option value="mastered">已掌握</option><option value="all">全部状态</option></select></label>
     </div><ErrorBox message={resource.error || action.error} retry={resource.error ? resource.reload : undefined} />
       {!resource.value && !resource.error && <Loading />}

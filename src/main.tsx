@@ -159,7 +159,6 @@ function CertificateForm({ current, today, close, onSaved }: { current?: Snapsho
       });
     }}>
       <label>证书名称<input name="name" required maxLength={100} defaultValue={current?.name} placeholder="例如：信息系统项目管理师" /></label>
-      {!current && <label>第一个科目<input name="course" required maxLength={100} placeholder="例如：综合知识" /></label>}
       <label>考试日期<input name="examDate" type="date" required min={current ? undefined : today} defaultValue={current?.examDate} /></label>
       {current?.plan && <p className="muted">改期会重新安排待完成任务，保留已完成记录。</p>}
       <ErrorBox message={action.error} />

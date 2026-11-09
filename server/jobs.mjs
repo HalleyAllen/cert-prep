@@ -7,21 +7,32 @@ import { chapterUnits, insertQuestion } from './study.mjs';
 
 const hashUnits = (units) => createHash('sha256').update(JSON.stringify(units)).digest('hex');
 
-function extractInWorker(input, progress) {
+function extractInWorker(input, progress, signal) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./importer.mjs', import.meta.url), { workerData: input });
     let settled = false;
+    let cancelDeadline;
+    const timeoutMinutes = input.extension === '.pdf' ? 120 : 45;
     const timeout = setTimeout(() => {
-      settled = true;
+      finish(reject, new Error('识别时间过长。请将资料拆成较小的文件再导入。'));
       void worker.terminate();
-      reject(new Error('识别时间过长。请将资料拆成较小的文件再导入。'));
-    }, 45 * 60 * 1000);
+    }, timeoutMinutes * 60 * 1000);
+    const cancel = () => {
+      worker.postMessage('cancel');
+      cancelDeadline = setTimeout(() => {
+        finish(reject, signal.reason);
+        void worker.terminate();
+      }, 30_000);
+    };
     const finish = (callback, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      clearTimeout(cancelDeadline);
+      signal.removeEventListener('abort', cancel);
       callback(value);
     };
+    signal.addEventListener('abort', cancel, { once: true });
     worker.on('message', (event) => {
       if (event.error) finish(reject, new Error(event.error));
       else if (event.units) finish(resolve, event.units);
@@ -35,6 +46,13 @@ function extractInWorker(input, progress) {
 export function createJobs(store, dataRoot, services) {
   let active = false;
   let stopped = false;
+  let currentImport;
+  const cancelImport = (id) => {
+    const result = store.run(`UPDATE jobs SET status='cancelled', message='已取消导入，可使用原文件重试'
+      WHERE id=? AND kind='import' AND status IN ('queued', 'running')`, id);
+    if (result.changes && currentImport?.id === id) currentImport.controller.abort();
+    return Boolean(result.changes);
+  };
   const enqueue = (certId, kind, targetId, input = {}) => {
     const activeJob = store.get("SELECT id FROM jobs WHERE kind=? AND target_id=? AND status IN ('queued','running')", kind, targetId);
     if (activeJob) return activeJob.id;
@@ -46,17 +64,25 @@ export function createJobs(store, dataRoot, services) {
 
   async function execute(job) {
     const input = parse(job.input);
-    const progress = (value, message) => store.run('UPDATE jobs SET progress=?, message=? WHERE id=?', value, message, job.id);
+    const progress = (value, message) => store.run('UPDATE jobs SET progress=?, message=? WHERE id=? AND status=\'running\'', value, message, job.id);
     const finish = (message) => store.run("UPDATE jobs SET status='succeeded', progress=100, message=? WHERE id=?", message, job.id);
     store.run("UPDATE jobs SET status='running', progress=2, message='正在准备' WHERE id=?", job.id);
     if (job.kind === 'import') {
       const material = store.get('SELECT * FROM materials WHERE id=?', job.target_id);
-      const units = await extractInWorker({ filePath: join(dataRoot, 'uploads', material.file_key), extension: material.extension,
-        forceOcr: input.forceOcr }, progress);
+      const controller = new AbortController();
+      currentImport = { id: job.id, controller };
+      let units;
+      try {
+        units = await extractInWorker({ filePath: join(dataRoot, 'uploads', material.file_key), extension: material.extension,
+          forceOcr: input.forceOcr }, progress, controller.signal);
+        controller.signal.throwIfAborted();
+      } finally {
+        currentImport = undefined;
+      }
       store.transaction(() => {
         const start = store.get('SELECT COALESCE(MAX(position), 0) AS count FROM chapters WHERE course_id=?', material.course_id).count;
-        units.forEach((unit, index) => store.run('INSERT INTO units VALUES (?, ?, ?, ?, ?, ?)',
-          material.id, index + 1, unit.page, unit.text, unit.method, unit.heading));
+        units.forEach((unit, index) => store.run(`INSERT INTO units (material_id, position, page, text, method, heading, marks, visuals)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, material.id, index + 1, unit.page, unit.text, unit.method, unit.heading, JSON.stringify(unit.marks), JSON.stringify(unit.visuals ?? [])));
         const chapters = suggestedChapters(units, material.name);
         chapters.forEach((chapter, index) => store.run(`INSERT INTO chapters
           (id, course_id, material_id, title, start_unit, end_unit, position) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -68,6 +94,7 @@ export function createJobs(store, dataRoot, services) {
     }
     const chapter = store.get('SELECT * FROM chapters WHERE id=?', job.target_id);
     const units = chapterUnits(store, chapter);
+    if (!units.length) throw new Error('本章没有原文片段，请先调整章节范围。');
     const hash = hashUnits(units);
     if (job.kind === 'analyze') {
       const result = await services.analyze(chapter.title, units, progress);
@@ -113,7 +140,7 @@ export function createJobs(store, dataRoot, services) {
           if (!job) break;
           try { await execute(job); }
           catch (error) {
-            store.run("UPDATE jobs SET status='failed', message=? WHERE id=?", String(error.message).slice(0, 450), job.id);
+            store.run("UPDATE jobs SET status='failed', message=? WHERE id=? AND status='running'", String(error.message).slice(0, 450), job.id);
           }
         }
       } finally { active = false; }
@@ -121,5 +148,5 @@ export function createJobs(store, dataRoot, services) {
   }
   store.run("UPDATE jobs SET status='queued', progress=0, message='服务重启，等待处理' WHERE status='running'");
   kick();
-  return { enqueue, kick, isActive: () => active, stop: () => { stopped = true; } };
+  return { enqueue, kick, cancelImport, isActive: () => active, stop: () => { stopped = true; } };
 }

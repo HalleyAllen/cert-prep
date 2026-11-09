@@ -13,18 +13,20 @@ export function imageFixture(format = 'image/png') {
   return canvas.toBuffer(format);
 }
 
-export function pdfFixture(scanned = false) {
+export function pdfFixture(scanned = false, pageCount = 1) {
   const stream = (body, extra = '') => Buffer.concat([
     Buffer.from(`<< /Length ${body.length} ${extra} >>\nstream\n`), body, Buffer.from('\nendstream'),
   ]);
+  const pageRefs = ['3 0 R', ...Array.from({ length: pageCount - 1 }, (_, index) => `${index + 6} 0 R`)];
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
-    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Pages /Kids [${pageRefs.join(' ')}] /Count ${pageCount} >>`,
     `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 630 340] /Resources << ${scanned ? '/XObject << /Im0 5 0 R >>' : '/Font << /F1 5 0 R >>'} >> /Contents 4 0 R >>`,
-    stream(Buffer.from(scanned ? 'q 610 0 0 279 10 30 cm /Im0 Do Q' : 'BT /F1 22 Tf 45 265 Td (Chapter 1 Project Scope) Tj 0 -35 Td (Scope defines the boundaries of a project.) Tj ET')),
+    stream(Buffer.from(scanned ? 'q 610 0 0 279 10 30 cm /Im0 Do Q' : 'q 1 1 0 rg 42 225 510 27 re f Q BT /F1 22 Tf 45 265 Td (Chapter 1 Project Scope) Tj 0 -35 Td 0.78 0 0 rg (Scope defines the boundaries of a project.) Tj 0 0 0 rg 0 -220 Td (Page 1) Tj ET q 0 0 0 RG 1 w 45 228 m 440 228 l S Q')),
     scanned ? stream(imageFixture('image/jpeg'), '/Type /XObject /Subtype /Image /Width 1050 /Height 480 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode')
       : '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
   ];
+  objects.push(...Array.from({ length: pageCount - 1 }, () => objects[2]));
   const chunks = [Buffer.from('%PDF-1.4\n')];
   const offsets = [];
   let position = chunks[0].length;
@@ -34,7 +36,7 @@ export function pdfFixture(scanned = false) {
     chunks.push(bytes);
     position += bytes.length;
   });
-  chunks.push(Buffer.from(`xref\n0 6\n0000000000 65535 f \n${offsets.map((offset) => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${position}\n%%EOF\n`));
+  chunks.push(Buffer.from(`xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.map((offset) => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${position}\n%%EOF\n`));
   return Buffer.concat(chunks);
 }
 
@@ -42,7 +44,7 @@ export function docxFixture() {
   const entries = {
     '[Content_Types].xml': '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
     '_rels/.rels': '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
-    'word/document.xml': '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>第一章 质量管理</w:t></w:r></w:p><w:p><w:r><w:t>验收依据是约定的标准与证据。</w:t></w:r></w:p></w:body></w:document>',
+    'word/document.xml': '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>第一章 质量管理</w:t></w:r></w:p><w:p><w:r><w:rPr><w:color w:val="C00000"/><w:highlight w:val="yellow"/><w:u w:val="single"/></w:rPr><w:t>验收依据是约定的标准与证据。</w:t></w:r></w:p></w:body></w:document>',
   };
   const locals = [];
   const directory = [];

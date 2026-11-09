@@ -6,6 +6,10 @@ import multer from 'multer';
 import { z } from 'zod';
 import { localDay, saveSchedule, shiftDay, validDay } from './planner.mjs';
 import { now, owner, parse } from './store.mjs';
+import { correctMarks } from './rich-text.mjs';
+import { renderPdfVisual } from './pdf-visual.mjs';
+import { deleteMaterial } from './material-deletion.mjs';
+import { selectStudyChapters } from './study-chapters.mjs';
 import { Problem, publicLink, questionInput, validated } from './services.mjs';
 import { chapterUnits, completeKind, insertQuestion, openAttempt, questionView, submitAttempt, withoutAnswer } from './study.mjs';
 
@@ -18,12 +22,15 @@ const chapterInput = z.object({ title: str(140), start: z.number().int().positiv
   studyMinutes: z.number().int().min(5).max(720), practiceMinutes: z.number().int().min(5).max(720) });
 const searchSource = z.object({ url: str(2000).refine((url) => !!publicLink(url), '请填写有效的网页链接。'),
   title: str(300), snippet: z.string().max(1600).default(''), official: z.boolean().default(false) });
+export const materialUploadLimitMB = 500;
+const materialUploadLimitBytes = materialUploadLimitMB * 1024 * 1024;
+const materialCategory = z.enum(['textbook', 'supplement']);
 const supported = new Set(['.pdf', '.docx', '.txt', '.png', '.jpg', '.jpeg']);
 const toCertificate = ({ id, name, exam_date, demo, plan_settings }) => ({ id, name, examDate: exam_date, demo: !!demo,
   plan: plan_settings ? parse(plan_settings) : null });
 const jobFields = 'id, kind, target_id, status, progress, message, created_at';
 const chapterFields = `ch.id, ch.course_id, ch.material_id, ch.title, ch.start_unit, ch.end_unit, ch.study_minutes,
-  ch.practice_minutes, ch.learned_at, ch.practiced_at, ch.visited_at, ma.name AS material_name,
+  ch.practice_minutes, ch.learned_at, ch.practiced_at, ch.visited_at, ma.name AS material_name, ma.category AS material_category,
   (SELECT COUNT(*) FROM questions q WHERE q.chapter_id=ch.id AND q.approved=1) AS question_count`;
 
 function find(store, sql, params, label) {
@@ -43,7 +50,8 @@ export function createApi(store, root, services, jobs) {
   const owned = express.Router({ mergeParams: true });
   const upload = multer({
     storage: multer.diskStorage({ destination: join(root, 'uploads'), filename: (_req, _file, cb) => cb(null, randomUUID()) }),
-    limits: { fileSize: 100 * 1024 * 1024, files: 1, fields: 1, fieldSize: 16 },
+    // The multipart parser rejects files that reach its limit, so allow the exact maximum.
+    limits: { fileSize: materialUploadLimitBytes + 1, files: 1, fields: 2, fieldSize: 16 },
     fileFilter: (_req, file, cb) => cb(supported.has(extname(file.originalname).toLowerCase()) ? null
       : new Problem(400, '请选择 PDF、DOCX、TXT、JPG 或 PNG 文件。'), true),
   });
@@ -69,7 +77,7 @@ export function createApi(store, root, services, jobs) {
     certificates: store.all('SELECT * FROM certificates WHERE owner=? ORDER BY demo ASC, updated_at DESC, id', owner).map(toCertificate) }));
 
   api.post('/certificates', (req, res) => {
-    const data = validated(z.object({ name: str(100), course: str(100), examDate: editableDate }), req.body);
+    const data = validated(z.object({ name: str(100), course: str(100).default('默认科目'), examDate: editableDate }), req.body);
     if (data.examDate < localDay()) throw new Problem(400, '新证书的考试日期不能早于今天。');
     const id = randomUUID();
     store.transaction(() => {
@@ -89,8 +97,8 @@ export function createApi(store, root, services, jobs) {
     const id = cert(req).id;
     const chapters = store.all(`SELECT ${chapterFields} FROM chapters ch JOIN courses co ON co.id=ch.course_id
       JOIN materials ma ON ma.id=ch.material_id WHERE co.certificate_id=?
-      ORDER BY co.position, ma.created_at, ma.id, ch.start_unit, ch.position`, id);
-    const materials = store.all(`SELECT ma.id, ma.course_id, ma.name, ma.extension, ma.extracted, ma.created_at,
+      ORDER BY co.position, (ma.category='textbook') DESC, ma.created_at, ma.id, ch.start_unit, ch.position`, id);
+    const materials = store.all(`SELECT ma.id, ma.course_id, ma.name, ma.extension, ma.extracted, ma.created_at, ma.category,
       (SELECT COUNT(*) FROM units un WHERE un.material_id=ma.id) AS unit_count,
       (SELECT j.id FROM jobs j WHERE j.kind='import' AND j.target_id=ma.id ORDER BY j.created_at DESC, j.rowid DESC LIMIT 1) AS job_id
       FROM materials ma JOIN courses co ON co.id=ma.course_id WHERE co.certificate_id=? ORDER BY ma.created_at DESC`, id);
@@ -100,6 +108,7 @@ export function createApi(store, root, services, jobs) {
       JOIN questions q ON q.id=m.question_id JOIN chapters ch ON ch.id=q.chapter_id JOIN courses co ON co.id=ch.course_id
       WHERE co.certificate_id=?`, id);
     res.json({ certificate: toCertificate(cert(req)), today: localDay(), chapters, materials, tasks, mistakes: summary,
+      study_chapter_ids: selectStudyChapters(chapters).map(({ id }) => id),
       courses: store.all('SELECT * FROM courses WHERE certificate_id=? ORDER BY position', id),
       jobs: store.all(`SELECT ${jobFields} FROM jobs WHERE certificate_id=?
         AND (status IN ('queued', 'running') OR id IN (SELECT id FROM jobs WHERE certificate_id=? ORDER BY created_at DESC, rowid DESC LIMIT 35))
@@ -133,8 +142,10 @@ export function createApi(store, root, services, jobs) {
     let jobId;
     try {
       if (!req.file.size || !supported.has(extension) || name.length > 240) throw new Problem(400, '文件为空、文件名过长或格式不支持。');
+      const category = validated(materialCategory.default('supplement'), req.body.category);
       store.transaction(() => {
-        store.run('INSERT INTO materials VALUES (?, ?, ?, ?, ?, 0, ?)', id, req.course.id, name, extension, req.file.filename, now());
+        store.run(`INSERT INTO materials (id, course_id, name, extension, file_key, created_at, category)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`, id, req.course.id, name, extension, req.file.filename, now(), category);
         jobId = jobs.enqueue(cert(req).id, 'import', id, { forceOcr: req.body.forceOcr === 'true' });
       });
     } catch (error) {
@@ -147,9 +158,21 @@ export function createApi(store, root, services, jobs) {
 
   owned.get('/materials/:materialId', (req, res) => {
     const row = material(req);
-    res.json({ id: row.id, name: row.name, extension: row.extension, course_id: row.course_id, extracted: row.extracted,
-      units: store.all('SELECT position, page, text, method FROM units WHERE material_id=? ORDER BY position', row.id),
+    res.json({ id: row.id, name: row.name, extension: row.extension, course_id: row.course_id, extracted: row.extracted, category: row.category,
+      units: store.all('SELECT position, page, text, method, marks, visuals FROM units WHERE material_id=? ORDER BY position', row.id)
+        .map((unit) => ({ ...unit, marks: parse(unit.marks), visuals: parse(unit.visuals) })),
       job: store.get(`SELECT ${jobFields} FROM jobs WHERE kind='import' AND target_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1`, row.id) || null });
+  });
+
+  owned.patch('/materials/:materialId', (req, res) => {
+    const row = material(req);
+    const { category } = validated(z.object({ category: materialCategory }), req.body);
+    store.run('UPDATE materials SET category=? WHERE id=?', category, row.id);
+    res.json({ ok: true });
+  });
+
+  owned.delete('/materials/:materialId', (req, res) => {
+    res.json(deleteMaterial(store, root, cert(req), material(req)));
   });
 
   owned.get('/materials/:materialId/file', (req, res) => {
@@ -157,6 +180,20 @@ export function createApi(store, root, services, jobs) {
     const file = join(root, 'uploads', row.file_key);
     if (row.extension === '.docx' || req.query.download === '1' || !row.extracted) return res.download(file, row.name);
     res.type(row.extension).sendFile(file);
+  });
+
+  owned.get('/materials/:materialId/units/:position/visuals/:index', async (req, res) => {
+    const row = material(req);
+    const position = Number(req.params.position);
+    const index = Number(req.params.index);
+    if (row.extension !== '.pdf' || !Number.isSafeInteger(position) || position < 1 || !Number.isSafeInteger(index) || index < 0) {
+      throw new Problem(404, '找不到原页图像。');
+    }
+    const unit = find(store, 'SELECT page, visuals FROM units WHERE material_id=? AND position=?', [row.id, position], '原文片段');
+    const visual = parse(unit.visuals)[index];
+    if (!unit.page || !visual) throw new Problem(404, '找不到原页图像。');
+    const image = await renderPdfVisual(join(root, 'uploads', row.file_key), unit.page, visual.bounds);
+    res.type('png').send(image);
   });
 
   owned.patch('/materials/:materialId/units/:position', (req, res) => {
@@ -167,21 +204,48 @@ export function createApi(store, root, services, jobs) {
     store.transaction(() => {
       const unit = find(store, 'SELECT * FROM units WHERE material_id=? AND position=?', [row.id, position], '原文片段');
       if (unit.text === text) return;
-      store.run('UPDATE units SET text=? WHERE material_id=? AND position=?', text, row.id, position);
+      const marks = correctMarks(parse(unit.marks), unit.text, text);
+      const visuals = parse(unit.visuals).filter(({ anchor }) => text.includes(anchor));
+      store.run('UPDATE units SET text=?, marks=?, visuals=? WHERE material_id=? AND position=?',
+        text, JSON.stringify(marks), JSON.stringify(visuals), row.id, position);
       store.run('UPDATE chapters SET analysis=NULL, analysis_hash=NULL WHERE material_id=? AND ? BETWEEN start_unit AND end_unit', row.id, position);
     });
     res.json({ ok: true });
   });
 
-  function validateRange(row, data) {
-    const unitCount = store.get('SELECT COUNT(*) AS count FROM units WHERE material_id=?', row.id).count;
-    if (data.end < data.start || data.end > unitCount) throw new Problem(400, `请选择从 1 到 ${unitCount} 的有效片段范围。`);
+  owned.delete('/materials/:materialId/units/:position', (req, res) => {
+    const row = material(req);
+    const position = Number(req.params.position);
+    if (!Number.isSafeInteger(position) || position < 1) throw new Problem(400, '原文片段编号无效。');
+    store.transaction(() => {
+      const result = store.run('DELETE FROM units WHERE material_id=? AND position=?', row.id, position);
+      if (!result.changes) throw new Problem(404, '找不到原文片段。');
+      const affected = store.all('SELECT id, start_unit, end_unit FROM chapters WHERE material_id=? AND ? BETWEEN start_unit AND end_unit', row.id, position);
+      for (const item of affected) {
+        const bounds = store.get(`SELECT MIN(position) AS first, MAX(position) AS last FROM units
+          WHERE material_id=? AND position BETWEEN ? AND ?`, row.id, item.start_unit, item.end_unit);
+        store.run('UPDATE chapters SET start_unit=?, end_unit=?, analysis=NULL, analysis_hash=NULL WHERE id=?',
+          bounds.first ?? item.start_unit, bounds.last ?? item.end_unit, item.id);
+      }
+    });
+    res.json({ ok: true });
+  });
+
+  function validateRange(materialId, { start, end }) {
+    const { count } = store.get('SELECT COUNT(*) AS count FROM units WHERE material_id=? AND position IN (?,?)', materialId, start, end);
+    if (end < start || count !== (start === end ? 1 : 2)) throw new Problem(400, '请选择仍然存在的起始和结束片段。');
+  }
+
+  function requireChapterSource(row) {
+    if (!store.get('SELECT 1 FROM units WHERE material_id=? AND position BETWEEN ? AND ? LIMIT 1', row.material_id, row.start_unit, row.end_unit)) {
+      throw new Problem(422, '本章没有原文片段，请先调整章节范围。');
+    }
   }
 
   owned.post('/materials/:materialId/chapters', (req, res) => {
     const row = material(req);
     const data = validated(chapterInput, req.body);
-    validateRange(row, data);
+    validateRange(row.id, data);
     const id = randomUUID();
     store.run(`INSERT INTO chapters (id, course_id, material_id, title, start_unit, end_unit, position, study_minutes, practice_minutes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, row.course_id, row.id, data.title, data.start, data.end,
@@ -191,20 +255,22 @@ export function createApi(store, root, services, jobs) {
 
   owned.get('/chapters/:chapterId', (req, res) => {
     const row = chapter(req);
-    const source = store.get('SELECT name, extension FROM materials WHERE id=?', row.material_id);
-    const units = chapterUnits(store, row);
+    const source = store.get('SELECT name, extension, category FROM materials WHERE id=?', row.material_id);
+    const bounds = store.get('SELECT COUNT(*) AS count, MIN(position) AS first, MAX(position) AS last FROM units WHERE material_id=?', row.material_id);
+    const units = chapterUnits(store, row, true);
     const drafts = store.all('SELECT * FROM questions WHERE chapter_id=? AND approved=0 ORDER BY created_at DESC', row.id).map(questionView);
     const questionCount = store.get('SELECT COUNT(*) AS count FROM questions WHERE chapter_id=? AND approved=1', row.id).count;
     res.json({ ...row, analysis: row.analysis ? parse(row.analysis) : null, units, drafts, question_count: questionCount,
-      material_name: source.name, extension: source.extension,
-      unit_count: store.get('SELECT COUNT(*) AS count FROM units WHERE material_id=?', row.material_id).count });
+      material_name: source.name, material_category: source.category, extension: source.extension,
+      unit_count: bounds.count, unit_min: bounds.first, unit_max: bounds.last });
   });
 
   owned.patch('/chapters/:chapterId', (req, res) => {
     const row = chapter(req);
     const data = validated(chapterInput, req.body);
-    validateRange({ id: row.material_id }, data);
-    const stale = row.title !== data.title || row.start_unit !== data.start || row.end_unit !== data.end;
+    const rangeChanged = row.start_unit !== data.start || row.end_unit !== data.end;
+    if (rangeChanged) validateRange(row.material_id, data);
+    const stale = row.title !== data.title || rangeChanged;
     store.run(`UPDATE chapters SET title=?, start_unit=?, end_unit=?, study_minutes=?, practice_minutes=?, analysis=?, analysis_hash=? WHERE id=?`,
       data.title, data.start, data.end, data.studyMinutes, data.practiceMinutes, stale ? null : row.analysis, stale ? null : row.analysis_hash, row.id);
     res.json({ ok: true });
@@ -227,21 +293,34 @@ export function createApi(store, root, services, jobs) {
 
   owned.post('/chapters/:chapterId/analyze', (req, res) => {
     const row = chapter(req);
+    requireChapterSource(row);
     requireAI();
     runJob(res, cert(req), 'analyze', row.id, {});
   });
 
   owned.post('/chapters/:chapterId/generate', (req, res) => {
     const row = chapter(req);
+    requireChapterSource(row);
     requireAI();
     const input = validated(z.object({ count: z.number().int().min(1).max(12) }), req.body);
     runJob(res, cert(req), 'generate', row.id, input);
   });
 
+  owned.post('/jobs/:jobId/cancel', (req, res) => {
+    const job = find(store, 'SELECT * FROM jobs WHERE id=? AND certificate_id=?', [req.params.jobId, cert(req).id], '任务');
+    if (job.status !== 'cancelled' && !jobs.cancelImport(job.id)) {
+      throw new Problem(409, '只有等待或识别中的资料可以取消。');
+    }
+    res.json({ ok: true });
+  });
+
   owned.post('/jobs/:jobId/retry', (req, res) => {
     const job = find(store, 'SELECT * FROM jobs WHERE id=? AND certificate_id=?', [req.params.jobId, cert(req).id], '任务');
-    if (job.status !== 'failed') throw new Problem(409, '只有失败的任务可以重试。');
-    if (job.kind !== 'import') requireAI();
+    if (!['failed', 'cancelled'].includes(job.status)) throw new Problem(409, '只有失败或已取消的任务可以重试。');
+    if (job.kind !== 'import') {
+      requireChapterSource(find(store, 'SELECT * FROM chapters WHERE id=?', [job.target_id], '章节'));
+      requireAI();
+    }
     if (job.kind === 'import' && store.get('SELECT extracted FROM materials WHERE id=?', job.target_id)?.extracted) {
       throw new Problem(409, '这份资料已成功导入。');
     }

@@ -59,10 +59,11 @@ export function Modal({ title, onClose, children }: { title: string; onClose: ()
   </dialog>;
 }
 
-export function JobLine({ job, retry }: { job: Job; retry: () => void }) {
+export function JobLine({ job, retry, cancel }: { job: Job; retry: () => void; cancel?: () => void }) {
   return <div className={`job ${job.status === 'failed' ? 'job-error' : ''}`} role="status">
     <div>{isActive(job) && <LoaderCircle size={16} className="spin" />}<span>{job.message}</span>{isActive(job) && <span>{job.progress}%</span>}
-      {job.status === 'failed' && <button className="btn small secondary" onClick={retry}>重试</button>}</div>
+      {(job.status === 'failed' || job.status === 'cancelled') && <button className="btn small secondary" onClick={retry}>重试</button>}
+      {cancel && isActive(job) && <button className="btn small secondary" onClick={cancel}>取消导入</button>}</div>
     {isActive(job) && <progress value={job.progress} max={100} aria-label="任务进度" />}
   </div>;
 }

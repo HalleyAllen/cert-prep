@@ -1,6 +1,6 @@
 import { ArrowDownRight, ArrowRight, BookOpen, CalendarCheck, CalendarDays, Check, Clock3, FilePlus2, ListChecks, Play, Target } from 'lucide-react';
 import { useState } from 'react';
-import { api, daysBetween, displayDay, kindLabel, type Context, type Task } from './model';
+import { api, daysBetween, displayDay, kindLabel, studyChapters, type Context, type Task } from './model';
 import { Empty, ErrorBox, Heading, TextLink, useAction } from './ui';
 
 function CoverIllustration() {
@@ -23,11 +23,12 @@ function CoverIllustration() {
 
 export function Dashboard({ ctx }: { ctx: Context }) {
   const { data, go } = ctx;
-  const learned = data.chapters.filter((chapter) => chapter.learned_at).length;
-  const practiced = data.chapters.filter((chapter) => chapter.practiced_at).length;
-  const percentage = data.chapters.length ? Math.round(learned / data.chapters.length * 100) : 0;
-  const next = data.chapters.filter((chapter) => chapter.visited_at).sort((a, b) => (b.visited_at || '').localeCompare(a.visited_at || ''))[0]
-    || data.chapters.find((chapter) => !chapter.learned_at || !chapter.practiced_at) || data.chapters[0];
+  const mainChapters = studyChapters(data);
+  const learned = mainChapters.filter((chapter) => chapter.learned_at).length;
+  const practiced = mainChapters.filter((chapter) => chapter.practiced_at).length;
+  const percentage = mainChapters.length ? Math.round(learned / mainChapters.length * 100) : 0;
+  const next = mainChapters.filter((chapter) => chapter.visited_at).sort((a, b) => (b.visited_at || '').localeCompare(a.visited_at || ''))[0]
+    || mainChapters.find((chapter) => !chapter.learned_at || !chapter.practiced_at) || mainChapters[0];
   const days = daysBetween(data.today, data.certificate.examDate);
   const tasks = data.tasks.filter((task) => task.day === data.today);
   const pending = tasks.filter((task) => !task.completed_at).length;
@@ -44,7 +45,7 @@ export function Dashboard({ ctx }: { ctx: Context }) {
       </div><CoverIllustration />
     </section>
     <section className="metrics" aria-label="备考数据">
-      <Metric icon={<BookOpen size={19} />} label="已学章节" value={learned} suffix={`/ ${data.chapters.length} 章`} color="mint" action={() => go('chapters')} />
+      <Metric icon={<BookOpen size={19} />} label="已学章节" value={learned} suffix={`/ ${mainChapters.length} 章`} color="mint" action={() => go('chapters')} />
       <Metric icon={<Target size={19} />} label="已完成练习" value={practiced} suffix="章" color="sand" action={() => go('chapters')} />
       <Metric icon={<ListChecks size={19} />} label="待复习错题" value={data.mistakes.pending} suffix="道" color="rose" action={() => go('mistakes')} />
     </section>
@@ -55,7 +56,7 @@ export function Dashboard({ ctx }: { ctx: Context }) {
       <section className="card panel progress-panel"><div className="panel-head"><div><h2>章节进度</h2><p>按科目查看学习完成情况</p></div><span className="percent">{percentage}%</span></div>
         <progress value={percentage} max={100} aria-label="章节总体进度" />
         <div className="course-progress">{data.courses.map((course) => {
-          const chapters = data.chapters.filter((chapter) => chapter.course_id === course.id);
+          const chapters = mainChapters.filter((chapter) => chapter.course_id === course.id);
           const done = chapters.filter((chapter) => chapter.learned_at).length;
           return <button key={course.id} onClick={() => go('chapters', course.id)}><span><BookOpen size={15} />{course.name}</span><small>{done}/{chapters.length} 章</small></button>;
         })}</div>
@@ -104,7 +105,7 @@ export function PlanPage({ ctx, editExam }: { ctx: Context; editExam: () => void
             ? value.filter((id) => id !== day.id) : [...value, day.id])} /><span>{day.label}</span></label>)}</div></fieldset>
         <ErrorBox message={action.error} />
         <button className="btn primary" disabled={action.busy || !weekdays.length}>{action.busy ? '正在排程…' : certificate.plan ? '重新排程 / 补排' : '生成学习计划'}</button>
-        <p className="muted">学习和练习可跨日拆分。重新排程会保留已完成的任务。</p>
+        <p className="muted">按学习清单排程，同名笔记不重复安排。重新排程会保留已完成的任务。</p>
       </form>
     </section>
     <section className="card panel"><div className="panel-head"><div><h2>任务日历</h2><p>{certificate.plan ? `${certificate.plan.studyDays} 个可用学习日 · ${certificate.plan.reviewDays} 天考前复习` : '生成计划后可查看逐日任务'}</p></div>

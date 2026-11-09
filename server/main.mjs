@@ -3,17 +3,19 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import express from 'express';
 import multer from 'multer';
-import { createApi } from './api.mjs';
+import { createApi, materialUploadLimitMB } from './api.mjs';
 import { seedDemo } from './demo.mjs';
 import { createJobs } from './jobs.mjs';
 import { createServices, Problem } from './services.mjs';
 import { openStore } from './store.mjs';
+import { cleanupUpload } from './material-deletion.mjs';
 
 const project = dirname(dirname(fileURLToPath(import.meta.url)));
 
 export function createApp({ root = process.env.CERT_PREP_DATA_DIR || join(project, 'data'), services = createServices(), demo = true } = {}) {
   const dataRoot = resolve(root);
   const store = openStore(dataRoot);
+  for (const { file_key: key } of store.all('SELECT file_key FROM deleted_uploads')) cleanupUpload(store, dataRoot, key);
   if (demo) seedDemo(store, dataRoot);
   const jobs = createJobs(store, dataRoot, services);
   const app = express();
@@ -40,7 +42,7 @@ export function createApp({ root = process.env.CERT_PREP_DATA_DIR || join(projec
     if (res.headersSent) return next(error);
     if (error instanceof Problem) return res.status(error.status).json({ error: error.message });
     if (error instanceof multer.MulterError) return res.status(400).json({ error: error.code === 'LIMIT_FILE_SIZE'
-      ? '文件超过 100 MB，请拆分后再上传。' : '上传格式无效，每次请选择一个文件。' });
+      ? `文件超过 ${materialUploadLimitMB} MB，请拆分后再上传。` : '上传格式无效，每次请选择一个文件。' });
     if (error.status === 400 || error.status === 413) return res.status(error.status).json({ error: '请求格式无效或内容过大。' });
     if (error.status === 404) return res.status(404).json({ error: '找不到原始文件。' });
     console.error(error);

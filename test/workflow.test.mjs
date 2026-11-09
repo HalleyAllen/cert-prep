@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -56,8 +57,9 @@ test('real local HTTP workflow survives errors, duplicate submissions and restar
   const course = (await call(base)).courses[0].id;
   await call(`${base}/chapters/demo-chapter-1`, 'GET', undefined, 404);
   await call(`${base}/courses`, 'POST', { name: '案例分析' }, 201);
-  const upload = async (name, body) => {
+  const upload = async (name, body, category) => {
     const form = new FormData(); form.set('file', new Blob([body]), name);
+    if (category) form.set('category', category);
     return call(`${base}/courses/${course}/materials`, 'POST', form, 202);
   };
   async function waitJob(jobId) {
@@ -138,4 +140,73 @@ test('real local HTTP workflow survives errors, duplicate submissions and restar
   await call(`${path}/analyze`, 'POST', undefined, 503);
   await call(`${base}/search`, 'POST', { query: '测试' }, 503);
   assert.equal((await call('/certificates/demo')).chapters.length, 6);
+
+  const kick = runtime.jobs.kick;
+  runtime.jobs.kick = () => {};
+  const pending = await upload('可取消.txt', '第一章 复习\n检查导入可以取消。\n第二章 重点\n准备重点。\n第三章 练习\n完成练习。');
+  await call(`${base}/materials/${pending.id}`, 'DELETE', undefined, 409);
+  await call(`${base}/jobs/${pending.jobId}/cancel`, 'POST');
+  const cancelled = await call(`${base}/materials/${pending.id}`);
+  assert.equal(cancelled.job.status, 'cancelled');
+  assert.deepEqual(cancelled.units, []);
+  runtime.jobs.kick = kick;
+  const resumed = await call(`${base}/jobs/${pending.jobId}/retry`, 'POST', undefined, 202);
+  assert.equal((await waitJob(resumed.jobId)).status, 'succeeded');
+
+  const combined = await call(`${base}/materials/${pending.id}/chapters`, 'POST',
+    { title: '跨片段复习', start: 1, end: 3, studyMinutes: 30, practiceMinutes: 10 }, 201);
+  await call(`${base}/materials/${pending.id}/units/2`, 'DELETE');
+  const merged = await call(`${base}/chapters/${combined.id}`);
+  assert.deepEqual(merged.units.map((unit) => unit.position), [1, 3]);
+  assert.equal(merged.unit_count, 2);
+  assert.equal(merged.unit_max, 3);
+  await call(`${base}/chapters/${combined.id}`, 'PATCH',
+    { title: '跨片段复习', start: 2, end: 3, studyMinutes: 30, practiceMinutes: 10 }, 400);
+  await call(`${base}/materials/${pending.id}/units/1`, 'DELETE');
+  const narrowed = await call(`${base}/chapters/${combined.id}`);
+  assert.deepEqual([narrowed.start_unit, narrowed.end_unit, narrowed.unit_min, narrowed.unit_max], [3, 3, 3, 3]);
+
+  await call(`/certificates/demo/materials/${material.id}/units/1`, 'DELETE', undefined, 404);
+  await call(`${base}/materials/${material.id}/units/1`, 'DELETE');
+  const empty = await call(path);
+  assert.deepEqual(empty.units, []);
+  assert.equal(empty.analysis, null);
+  assert.ok(empty.practiced_at);
+  assert.equal(empty.question_count, 2);
+  assert.deepEqual((await call(`${base}/materials/${material.id}`)).units.map((unit) => unit.position), [2]);
+  assert.equal((await call(`${base}/mistakes`))[0].wrong_count, 2);
+  await call(`${path}/analyze`, 'POST', undefined, 422);
+
+  const original = runtime.store.get('SELECT file_key FROM materials WHERE id=?', material.id);
+  const originalPath = join(root, 'uploads', original.file_key);
+  assert.equal(existsSync(originalPath), true);
+  await call(`/certificates/demo/materials/${material.id}`, 'DELETE', undefined, 404);
+  assert.deepEqual(await call(`${base}/materials/${material.id}`, 'DELETE'), { ok: true, fileCleanupPending: false });
+  assert.equal(existsSync(originalPath), false);
+  await call(`${base}/materials/${material.id}`, 'GET', undefined, 404);
+  await call(path, 'GET', undefined, 404);
+  await call(`${base}/attempts/${attempt.id}`, 'GET', undefined, 404);
+  await call(`${base}/attempts/${retake.id}`, 'GET', undefined, 404);
+  assert.deepEqual(await call(`${base}/mistakes`), []);
+  const remaining = await call(base);
+  const removedChapters = new Set(snapshot.chapters.map((chapter) => chapter.id));
+  assert.ok(remaining.tasks.every((task) => !removedChapters.has(task.chapter_id)));
+  assert.ok(remaining.certificate.plan.unscheduled.every((task) => !removedChapters.has(task.chapterId)));
+  assert.ok(remaining.materials.some((item) => item.id === pending.id));
+  assert.ok(remaining.materials.some((item) => item.id === broken.id));
+  assert.ok(remaining.jobs.every((job) => job.target_id !== material.id && !removedChapters.has(job.target_id)));
+
+  const textbook = await upload('课本.txt', '第 3 章练习\n教材正文。', 'textbook');
+  assert.equal((await waitJob(textbook.jobId)).status, 'succeeded');
+  const withTextbook = await call(base);
+  const textbookChapter = withTextbook.chapters.find((chapter) => chapter.material_id === textbook.id);
+  const noteChapter = withTextbook.chapters.find((chapter) => chapter.material_id === pending.id && chapter.title === '第三章 练习');
+  assert.ok(textbookChapter && noteChapter);
+  assert.ok(withTextbook.study_chapter_ids.includes(textbookChapter.id));
+  assert.ok(!withTextbook.study_chapter_ids.includes(noteChapter.id));
+  await call(`${base}/plan`, 'POST', { minutes: 120, weekdays: [0, 1, 2, 3, 4, 5, 6] });
+  const dedupedPlan = await call(base);
+  const plannedIds = new Set([...dedupedPlan.tasks.map((task) => task.chapter_id), ...dedupedPlan.certificate.plan.unscheduled.map((task) => task.chapterId)]);
+  assert.ok(plannedIds.has(textbookChapter.id));
+  assert.ok(!plannedIds.has(noteChapter.id));
 });

@@ -13,9 +13,10 @@ export function insertQuestion(store, chapterId, data, source, approved) {
   return id;
 }
 
-export function chapterUnits(store, chapter) {
-  return store.all(`SELECT position, page, text, method FROM units WHERE material_id=? AND position BETWEEN ? AND ?
+export function chapterUnits(store, chapter, withMarks = false) {
+  const rows = store.all(`SELECT position, page, text, method${withMarks ? ', marks, visuals' : ''} FROM units WHERE material_id=? AND position BETWEEN ? AND ?
     ORDER BY position`, chapter.material_id, chapter.start_unit, chapter.end_unit);
+  return withMarks ? rows.map((row) => ({ ...row, marks: parse(row.marks), visuals: parse(row.visuals) })) : rows;
 }
 
 export function completeKind(store, certId, chapterId, kind, at) {

@@ -27,6 +27,7 @@ export function openStore(root) {
       name TEXT NOT NULL, extension TEXT NOT NULL, file_key TEXT NOT NULL,
       extracted INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS deleted_uploads (file_key TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS units (
       material_id TEXT NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
       position INTEGER NOT NULL, page INTEGER, text TEXT NOT NULL,
@@ -77,7 +78,7 @@ export function openStore(root) {
     CREATE INDEX IF NOT EXISTS tasks_certificate ON plan_tasks(certificate_id, day, position);
     CREATE INDEX IF NOT EXISTS jobs_certificate ON jobs(certificate_id, created_at);
   `);
-  return {
+  const store = {
     run: (sql, ...params) => db.prepare(sql).run(...params),
     all: (sql, ...params) => db.prepare(sql).all(...params),
     get: (sql, ...params) => db.prepare(sql).get(...params),
@@ -94,4 +95,17 @@ export function openStore(root) {
       }
     },
   };
+  store.transaction(() => {
+    const columns = store.all('PRAGMA table_info(materials)');
+    if (!columns.some((column) => column.name === 'category')) {
+      store.run("ALTER TABLE materials ADD COLUMN category TEXT NOT NULL DEFAULT 'supplement' CHECK (category IN ('textbook', 'supplement'))");
+    }
+    if (!store.all('PRAGMA table_info(units)').some((column) => column.name === 'marks')) {
+      store.run("ALTER TABLE units ADD COLUMN marks TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!store.all('PRAGMA table_info(units)').some((column) => column.name === 'visuals')) {
+      store.run("ALTER TABLE units ADD COLUMN visuals TEXT NOT NULL DEFAULT '[]'");
+    }
+  });
+  return store;
 }

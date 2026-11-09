@@ -27,11 +27,11 @@ export function seedDemo(store, root) {
       const subset = lessons.slice(index * 3, index * 3 + 3);
       store.run('INSERT INTO courses VALUES (?, ?, ?, ?)', course, cert.id, name, index + 1);
       writeFileSync(join(root, 'uploads', `${material}.txt`), subset.map((lesson, position) => `第${index * 3 + position + 1}章 ${lesson[0]}\n${lesson[1]}`).join('\n\n'));
-      store.run('INSERT INTO materials VALUES (?, ?, ?, ?, ?, 1, ?)', material, course, `${name} · 示例讲义.txt`, '.txt', `${material}.txt`, at);
+      store.run('INSERT INTO materials (id, course_id, name, extension, file_key, extracted, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)', material, course, `${name} · 示例讲义.txt`, '.txt', `${material}.txt`, at);
       for (const [position, [title, text, point, hint, stem, options, answer]] of subset.entries()) {
         const chapterId = `demo-chapter-${index * 3 + position + 1}`;
         const analysis = { sections: [{ summary: text, points: [{ kind: 'key', title: point, explanation: hint, units: [position + 1] }] }], generatedAt: at };
-        store.run('INSERT INTO units VALUES (?, ?, NULL, ?, ?, ?)', material, position + 1, text, 'text', title);
+        store.run('INSERT INTO units (material_id, position, page, text, method, heading) VALUES (?, ?, NULL, ?, ?, ?)', material, position + 1, text, 'text', title);
         store.run(`INSERT INTO chapters (id, course_id, material_id, title, start_unit, end_unit, position, analysis, learned_at, visited_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, chapterId, course, material, title, position + 1, position + 1, position + 1,
         JSON.stringify(analysis), index === 0 && position < 2 ? at : null, index === 0 && position === 1 ? at : null);

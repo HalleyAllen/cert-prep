@@ -1,68 +1,170 @@
-import { copyFile, mkdtemp, readFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import { parentPort, workerData } from 'node:worker_threads';
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import mammoth from 'mammoth';
-import { createWorker } from 'tesseract.js';
+import { createOcrPool, defaultOcrConcurrency } from './ocr-pool.mjs';
+import { cleanPageText, isChapterHeading, isFrontMatter, pageEdge } from './text-cleanup.mjs';
+import { editMarks, joinMarked, sliceMarks, trimMarked } from './rich-text.mjs';
+import { createPageSampler } from './page-marks.mjs';
+import { normalizedPdfBounds, pdfTableRules, reflowPdfPage } from './pdf-layout.mjs';
+import { readWordMarks } from './word-marks.mjs';
+import { applyPdfOutline, chapterLabel, isContentsEntry, isReferenceHeading, pdfChapterOutline } from './pdf-structure.mjs';
 
 const require = createRequire(import.meta.url);
-const headingPattern = /^(?:第\s*[一二三四五六七八九十百零〇两\d]+\s*[章节篇部]|chapter\s+\d+\b|unit\s+\d+\b|#{1,3}\s+)/iu;
 
-export function splitUnits(text, page, method) {
+export function splitUnits(text, page, method, marks = [], detectHeadings = true, visuals = null) {
   const blocks = [];
   let lines = [];
   let heading = null;
   const flush = () => {
-    let body = lines.join('\n').trim();
-    while (body.length > 2200) {
-      const newline = body.lastIndexOf('\n', 2200);
-      const end = newline > 1000 ? newline : 2200;
-      blocks.push({ page, method, heading, text: body.slice(0, end) });
+    let body = trimMarked(joinMarked(lines, '\n'), Boolean(visuals));
+    while (body.text.length > 2200) {
+      const newline = body.text.lastIndexOf('\n', 2200);
+      const marker = visuals?.find(({ anchor }) => {
+        const start = body.text.indexOf(anchor);
+        return start >= 0 && start < 2200 && start + anchor.length > 2200;
+      });
+      const end = newline > 1000 ? newline : marker ? body.text.indexOf(marker.anchor) : 2200;
+      const text = body.text.slice(0, end);
+      blocks.push({ page, method, heading, text, marks: sliceMarks(body.marks, 0, end), visuals: visuals?.filter(({ anchor }) => text.includes(anchor)) });
       heading = null;
-      body = body.slice(end).trimStart();
+      body = trimMarked({ text: body.text.slice(end), marks: sliceMarks(body.marks, end, body.text.length) }, Boolean(visuals));
     }
-    if (body) blocks.push({ page, method, heading, text: body });
+    if (body.text) blocks.push({ page, method, heading, ...body, visuals: visuals?.filter(({ anchor }) => body.text.includes(anchor)) });
     lines = [];
     heading = null;
   };
+  let offset = 0;
   for (const raw of text.replace(/\r\n?/g, '\n').split('\n')) {
-    const line = raw.trim();
-    if (line.length < 150 && headingPattern.test(line)) {
+    const line = trimMarked({ text: raw, marks: sliceMarks(marks, offset, offset + raw.length) }, Boolean(visuals));
+    if (detectHeadings && isChapterHeading(line.text) && !isContentsEntry(line.text)) {
       flush();
-      heading = line.replace(/^#+\s*/, '');
+      heading = line.text.replace(/^#+\s*/, '');
     }
     lines.push(line);
+    offset += raw.length + 1;
   }
   flush();
   return blocks;
 }
 
 export function suggestedChapters(units, filename) {
-  const headings = units.flatMap((unit, index) => unit.heading ? [{ title: unit.heading, start: index + 1 }] : []);
-  if (headings.length === 0) return [{ title: filename.replace(/\.[^.]+$/, '').slice(0, 140), start: 1, end: units.length }];
-  if (headings[0].start > 1) headings.unshift({ title: '导言', start: 1 });
+  const seen = new Set();
+  const headings = units.flatMap((unit, index) => {
+    if (!unit.heading || isFrontMatter(unit.heading) || isContentsEntry(unit.heading) || isReferenceHeading(unit.heading)) return [];
+    const label = chapterLabel(unit.heading);
+    const key = label ? label.kind + ':' + label.ordinal : unit.heading.replace(/\s+/gu, '');
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [{ title: unit.heading, start: index + 1 }];
+  });
+  if (headings.length === 0) {
+    if (units.some((unit) => unit.heading && isFrontMatter(unit.heading))) return [];
+    return [{ title: filename.replace(/\.[^.]+$/, '').slice(0, 140), start: 1, end: units.length }];
+  }
   return headings.map((heading, index) => ({ ...heading, title: heading.title.slice(0, 140),
     end: (headings[index + 1]?.start ?? units.length + 1) - 1 }));
 }
 
-export async function extractMaterial({ filePath, extension, forceOcr = false }, progress = () => {}) {
-  const buffer = await readFile(filePath);
-  let ocr;
-  let langPath;
-  const recognize = async (image) => {
-    if (!ocr) {
-      langPath = await mkdtemp(join(tmpdir(), 'cert-prep-ocr-'));
-      for (const lang of ['chi_sim', 'eng']) {
-        const languageRoot = dirname(require.resolve(`@tesseract.js-data/${lang}/package.json`));
-        const filename = `${lang}.traineddata.gz`;
-        await copyFile(join(languageRoot, '4.0.0_best_int', filename), join(langPath, filename));
+function pdfLines(items, viewport) {
+  const lines = [];
+  let text = '';
+  let boxes = [];
+  let bounds;
+  let baseline;
+  const flush = (keepBlank = false) => {
+    if (text.trim()) lines.push({ text, boxes, bounds: bounds && normalizedPdfBounds(bounds, viewport.width, viewport.height),
+      edge: bounds ? pageEdge(bounds, viewport.width, viewport.height) : null });
+    else if (keepBlank) lines.push({ text: '', edge: null });
+    text = '';
+    boxes = [];
+    bounds = undefined;
+    baseline = undefined;
+  };
+  for (const item of items) {
+    if (item.str === undefined) continue;
+    if (item.str.trim()) {
+      const [a, b, c, d, x, y] = item.transform;
+      const angle = Math.atan2(b, a);
+      let dx = Math.cos(angle);
+      let dy = Math.sin(angle);
+      let fontHeight = Math.hypot(c, d) || Math.abs(item.height);
+      let runWidth = Math.abs(item.width);
+      const origin = viewport.convertToViewportPoint(x, y);
+      let next = viewport.convertToViewportPoint(x + dx, y + dy);
+      if (Math.abs(next[1] - origin[1]) > Math.abs(next[0] - origin[0])
+        && item.str.length > 3 && item.height > runWidth * 2.5 && Math.hypot(c, d)) {
+        dx = c / Math.hypot(c, d);
+        dy = d / Math.hypot(c, d);
+        next = viewport.convertToViewportPoint(x + dx, y + dy);
+        fontHeight = runWidth;
+        runWidth = Math.abs(item.height);
       }
-      ocr = await createWorker('eng+chi_sim', 1, { langPath, cacheMethod: 'none' });
+      const horizontal = Math.abs(next[1] - origin[1]) < Math.abs(next[0] - origin[0]) / 3;
+      if (horizontal && baseline?.horizontal && Math.abs(origin[1] - baseline.y) > Math.max(4, Math.max(fontHeight, baseline.height) * 0.65)) flush();
+      baseline = { y: origin[1], height: fontHeight, horizontal };
+      const start = text.length;
+      const corners = [0, runWidth].flatMap((width) => [0, fontHeight].map((height) =>
+        viewport.convertToViewportPoint(x + dx * width - dy * height, y + dy * width + dx * height)));
+      const xs = corners.map(([left]) => left);
+      const ys = corners.map(([, top]) => top);
+      const box = { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+      boxes.push({ start, end: start + item.str.length, box, horizontal: box.x1 - box.x0 >= box.y1 - box.y0 });
+      bounds = { x0: Math.min(bounds?.x0 ?? Infinity, box.x0), y0: Math.min(bounds?.y0 ?? Infinity, box.y0),
+        x1: Math.max(bounds?.x1 ?? -Infinity, box.x1), y1: Math.max(bounds?.y1 ?? -Infinity, box.y1) };
     }
-    const { data } = await ocr.recognize(image);
-    return data.text.replace(/(?<=\p{Script=Han})[ \t]+(?=\p{Script=Han})/gu, '').trim();
+    text += item.str + (item.hasEOL ? '' : ' ');
+    if (item.hasEOL) flush(true);
+  }
+  flush();
+  return lines;
+}
+
+function markPdfLines(lines, sample, scale) {
+  return lines.map(({ text, edge, bounds, boxes }) => ({
+    text, edge, bounds, marks: (boxes ?? []).flatMap(({ start, end, box, horizontal }) => {
+      const scaled = { x0: box.x0 * scale, x1: box.x1 * scale, y0: box.y0 * scale, y1: box.y1 * scale };
+      return sample(text.slice(start, end), scaled, horizontal).map((mark) => ({
+        ...mark, start: mark.start + start, end: mark.end + start,
+      }));
+    }),
+  }));
+}
+
+function compactHan({ text, marks = [] }) {
+  const spaces = [...text.matchAll(/(?<=\p{Script=Han})[ \t]+(?=\p{Script=Han})/gu)];
+  for (const match of spaces.reverse()) {
+    const end = match.index + match[0].length;
+    text = text.slice(0, match.index) + text.slice(end);
+    marks = editMarks(marks, match.index, end, 0);
+  }
+  return trimMarked({ text, marks });
+}
+
+export async function extractMaterial({ filePath, extension, forceOcr = false, textOnly = false, ocrConcurrency = defaultOcrConcurrency() }, progress = () => {}, signal) {
+  signal?.throwIfAborted();
+  const buffer = await readFile(filePath);
+  const limit = Number.isInteger(ocrConcurrency) ? Math.max(1, Math.min(4, ocrConcurrency)) : defaultOcrConcurrency();
+  const ocr = createOcrPool(signal);
+  const recognize = async (canvas, sample = createPageSampler(canvas)) => {
+    const { data } = await ocr.recognize(canvas.toBuffer('image/png'));
+    const paragraphs = data.blocks?.flatMap((block) => block.paragraphs) ?? [];
+    const lines = paragraphs.flatMap((paragraph) => [
+      ...paragraph.lines.map((line) => {
+        let offset = 0;
+        const marks = line.words.flatMap((word) => {
+          const start = line.text.indexOf(word.text, offset);
+          if (start < 0) return [];
+          offset = start + word.text.length;
+          return sample(word.text, word.bbox, false).map((mark) => ({ ...mark, start: mark.start + start, end: mark.end + start }));
+        });
+        return { ...compactHan({ text: line.text, marks }), edge: pageEdge(line.bbox, canvas.width, canvas.height), bounds: normalizedPdfBounds(line.bbox, canvas.width, canvas.height) };
+      }),
+      { text: '', edge: null },
+    ]);
+    return lines.some((line) => line.text) ? lines : data.text.split(/\r?\n/u).map((text) => ({ ...compactHan({ text }), edge: null }));
   };
   try {
     let units = [];
@@ -70,38 +172,112 @@ export async function extractMaterial({ filePath, extension, forceOcr = false },
       if (!buffer.subarray(0, 1024).includes(Buffer.from('%PDF-'))) throw new Error('文件内容不是有效的 PDF。');
       const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
       const pdfRoot = dirname(require.resolve('pdfjs-dist/package.json'));
-      const task = pdfjs.getDocument({ data: new Uint8Array(buffer), isEvalSupported: false,
+      const data = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+      const task = pdfjs.getDocument({ data, isEvalSupported: false,
         cMapUrl: join(pdfRoot, 'cmaps') + '/', cMapPacked: true,
         standardFontDataUrl: join(pdfRoot, 'standard_fonts') + '/',
         wasmUrl: join(pdfRoot, 'wasm') + '/' });
       try {
         const pdf = await task.promise;
-        if (pdf.numPages > 500) throw new Error('PDF 超过 500 页，请拆分后导入。');
-        for (let number = 1; number <= pdf.numPages; number += 1) {
-          progress(Math.round((number - 1) / pdf.numPages * 90) + 5, `正在处理第 ${number} / ${pdf.numPages} 页`);
-          const page = await pdf.getPage(number);
-          const { items } = await page.getTextContent();
-          let text = items.map((item) => item.str === undefined ? '' : item.str + (item.hasEOL ? '\n' : ' ')).join('').trim();
-          const shouldOcr = forceOcr || (!/\p{L}/u.test(text) && text.replace(/\s/g, '').length < 16);
-          if (shouldOcr) {
+        if (pdf.numPages > 1000) throw new Error('PDF 超过 1000 页，请拆分后导入。');
+        const outline = await pdfChapterOutline(pdf, async (number) => {
+          signal?.throwIfAborted();
+          try {
+            const page = await pdf.getPage(number);
+            const { items } = await page.getTextContent();
+            const firstItems = items.filter((item) => item.str?.trim()).slice(0, 3).map((item) => item.str.trim());
+            const lines = pdfLines(items, page.getViewport({ scale: 1 })).filter((line) => line.text.trim()).slice(0, 3);
+            return [...firstItems, ...lines.map((line) => line.text)];
+          } catch { return []; }
+        });
+        const pages = [];
+        const firstPage = outline[0]?.page ?? 1;
+        const chapterStarts = new Set(outline.map((item) => item.page));
+        const pending = new Set();
+        progress(5, '正在读取页面并准备本机识别');
+        const total = pdf.numPages - firstPage + 1;
+        let completed = 0;
+        let failure;
+        const onPageDone = () => {
+          completed += 1;
+          progress(Math.round(completed / total * 90) + 5, `已处理 ${completed} / ${total} 页`);
+        };
+        const check = () => {
+          signal?.throwIfAborted();
+          if (failure) throw failure;
+        };
+        try {
+          for (let number = firstPage; number <= pdf.numPages; number += 1) {
+            if (pending.size >= limit) await Promise.race(pending);
+            check();
+            const page = await pdf.getPage(number);
+            const { items } = await page.getTextContent();
             const base = page.getViewport({ scale: 1 });
-            const viewport = page.getViewport({ scale: Math.min(2.5, 2700 / Math.max(base.width, base.height)) });
+            let lines = pdfLines(items, base);
+            if (outline.length && number > outline.at(-1).page && pdf.numPages - number < Math.max(4, pdf.numPages * 0.03)
+              && isReferenceHeading(lines.find((line) => line.text.trim())?.text ?? '')) break;
+            const body = lines.filter((line) => !line.edge || isChapterHeading(line.text.trim())).map((line) => line.text).join(' ');
+            const shouldOcr = !textOnly && (forceOcr || (!/\p{L}/u.test(body) && body.replace(/\s/g, '').length < 16));
+            if (!shouldOcr && !lines.some((line) => line.text.trim())) {
+              onPageDone();
+              page.cleanup();
+              continue;
+            }
+            const maxDimension = Math.max(base.width, base.height);
+            const scale = shouldOcr ? Math.min(2.5, 2700 / maxDimension) : Math.min(1.6, 1400 / maxDimension);
+            const viewport = page.getViewport({ scale });
             const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
-            await page.render({ canvas, canvasContext: canvas.getContext('2d'), viewport }).promise;
-            const recognized = await recognize(canvas.toBuffer('image/png'));
-            text = recognized || text;
+            let sample;
+            try {
+              const annotations = await page.getAnnotations({ intent: 'display' }).catch(() => []);
+              await page.render({ canvas, canvasContext: canvas.getContext('2d'), viewport, annotationMode: pdfjs.AnnotationMode.DISABLE }).promise;
+              sample = createPageSampler(canvas, annotations, viewport);
+            } catch (error) {
+              if (shouldOcr) throw error;
+            }
+            const save = (result, method) => {
+              pages[number - firstPage] = { page: number, method, lines: result, tableRules: pdfTableRules(canvas, result) };
+              onPageDone();
+            };
+            const release = () => { canvas.width = 1; canvas.height = 1; };
+            const textResult = () => sample ? markPdfLines(lines, sample, scale) : lines.map(({ text, edge, bounds }) => ({ text, edge, bounds }));
+            page.cleanup();
+            if (shouldOcr) {
+              const job = recognize(canvas, sample).then((recognized) => {
+                if (!signal?.aborted) {
+                  if (recognized.some((line) => line.text)) save(recognized, 'ocr');
+                  else save(textResult(), 'text');
+                }
+              }).catch((error) => { failure ??= error; }).finally(() => {
+                release();
+                pending.delete(job);
+              });
+              pending.add(job);
+            } else {
+              save(textResult(), 'text');
+              release();
+            }
           }
-          units.push(...splitUnits(text, number, shouldOcr ? 'ocr' : 'text'));
-          page.cleanup();
+        } finally {
+          await Promise.all(pending);
         }
+        check();
+        progress(96, '正在清理页码、水印和括号');
+        units = cleanPageText(pages.filter(Boolean), chapterStarts, reflowPdfPage)
+          .flatMap(({ text, page, method, marks, visuals }) => splitUnits(text, page, method, marks, !outline.length, visuals));
+        applyPdfOutline(units, outline);
       } finally {
         await task.destroy();
       }
     } else if (extension === '.docx') {
       if (buffer.subarray(0, 2).toString() !== 'PK') throw new Error('文件内容不是有效的 DOCX。');
       progress(35, '正在读取 Word 正文');
-      const { value } = await mammoth.extractRawText({ buffer });
-      units = splitUnits(value, null, 'text');
+      const marked = await readWordMarks(buffer).catch(() => null);
+      if (marked?.marks.length) units = splitUnits(marked.text, null, 'text', marked.marks);
+      else {
+        const { value } = await mammoth.extractRawText({ buffer });
+        units = splitUnits(value, null, 'text');
+      }
     } else if (extension === '.txt') {
       if (buffer.includes(0) && !['fffe', 'feff'].includes(buffer.subarray(0, 2).toString('hex'))) {
         throw new Error('TXT 包含二进制数据，请另存为 UTF-8 文本。');
@@ -126,23 +302,29 @@ export async function extractMaterial({ filePath, extension, forceOcr = false },
       context.fillStyle = '#fff';
       context.fillRect(0, 0, canvas.width, canvas.height);
       context.drawImage(image, 0, 0, canvas.width, canvas.height);
-      units = splitUnits(await recognize(canvas.toBuffer('image/png')), 1, 'ocr');
+      const [page] = cleanPageText([{ page: 1, method: 'ocr', lines: await recognize(canvas) }]);
+      units = splitUnits(page.text, page.page, page.method, page.marks);
     }
+    signal?.throwIfAborted();
     if (!units.length) throw new Error('没有识别到文字。请检查清晰度，或在导入时启用整份 PDF OCR。');
     if (units.length > 5000) throw new Error('资料文字量过大，请拆成多份导入。');
     return units;
   } finally {
-    if (ocr) await ocr.terminate();
-    if (langPath) await rm(langPath, { recursive: true, force: true });
+    await ocr.close();
   }
 }
 
 if (parentPort && workerData) {
+  const controller = new AbortController();
+  const onMessage = (message) => { if (message === 'cancel') controller.abort(); };
+  parentPort.on('message', onMessage);
   try {
-    const units = await extractMaterial(workerData, (progress, message) => parentPort.postMessage({ progress, message }));
+    const units = await extractMaterial(workerData, (progress, message) => parentPort.postMessage({ progress, message }), controller.signal);
     parentPort.postMessage({ units });
   } catch (error) {
     const message = error.name === 'PasswordException' ? 'PDF 已加密，请先另存为无需密码的版本。' : error.message;
     parentPort.postMessage({ error: message });
+  } finally {
+    parentPort.off('message', onMessage);
   }
 }

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { now } from './store.mjs';
+import { selectStudyChapters } from './study-chapters.mjs';
 
 export function localDay(date = new Date()) {
   const year = date.getFullYear();
@@ -71,9 +72,9 @@ export function schedule({ today, examDate, settings, chapters, completed }) {
 }
 
 export function saveSchedule(store, cert, settings, today) {
-  const chapters = store.all(`SELECT ch.* FROM chapters ch JOIN courses co ON co.id=ch.course_id
+  const chapters = selectStudyChapters(store.all(`SELECT ch.*, ma.category AS material_category FROM chapters ch JOIN courses co ON co.id=ch.course_id
     JOIN materials ma ON ma.id=ch.material_id WHERE co.certificate_id=?
-    ORDER BY co.position, ma.created_at, ma.id, ch.start_unit, ch.position`, cert.id);
+    ORDER BY co.position, (ma.category='textbook') DESC, ma.created_at, ma.id, ch.start_unit, ch.position`, cert.id));
   const completed = store.all('SELECT * FROM plan_tasks WHERE certificate_id=? AND completed_at IS NOT NULL', cert.id);
   const result = schedule({ today, examDate: cert.exam_date, settings, chapters, completed });
   store.run('UPDATE certificates SET plan_settings=?, updated_at=? WHERE id=?',
