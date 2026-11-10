@@ -7,14 +7,17 @@ import { createApi, materialUploadLimitMB } from './api.mjs';
 import { seedDemo } from './demo.mjs';
 import { createJobs } from './jobs.mjs';
 import { createServices, Problem } from './services.mjs';
+import { createServiceSettings } from './service-settings.mjs';
 import { openStore } from './store.mjs';
 import { cleanupUpload } from './material-deletion.mjs';
 
 const project = dirname(dirname(fileURLToPath(import.meta.url)));
 
-export function createApp({ root = process.env.CERT_PREP_DATA_DIR || join(project, 'data'), services = createServices(), demo = true } = {}) {
+export function createApp({ root = process.env.CERT_PREP_DATA_DIR || join(project, 'data'), services: adapter, demo = true } = {}) {
   const dataRoot = resolve(root);
   const store = openStore(dataRoot);
+  const settings = createServiceSettings(dataRoot);
+  const services = adapter ?? createServices(settings.env);
   for (const { file_key: key } of store.all('SELECT file_key FROM deleted_uploads')) cleanupUpload(store, dataRoot, key);
   if (demo) seedDemo(store, dataRoot);
   const jobs = createJobs(store, dataRoot, services);
@@ -30,7 +33,7 @@ export function createApp({ root = process.env.CERT_PREP_DATA_DIR || join(projec
     next();
   });
   app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
-  app.use('/api', express.json({ limit: '2mb' }), createApi(store, dataRoot, services, jobs));
+  app.use('/api', express.json({ limit: '2mb' }), createApi(store, dataRoot, services, jobs, settings));
   app.use('/api', (_req, _res, next) => next(new Problem(404, '接口不存在。')));
   const dist = join(project, 'dist');
   app.use(express.static(dist));

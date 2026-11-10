@@ -34,7 +34,7 @@ export function SearchPage({ ctx, initialChapter }: { ctx: Context; initialChapt
             {ctx.data.courses.find((course) => course.id === chapter.course_id)?.name} · {chapter.title} · {materialLabels[chapter.material_category]}</option>)}
         </select></label>
         <label>搜索关键词<input value={query} maxLength={400} onChange={(event) => setQuery(event.target.value)} placeholder="证书 科目 章节 试题" required /></label>
-        {!ctx.searchReady && <div className="callout">在 .env 配置 TAVILY_API_KEY 后即可联网搜索。已有网页链接也可以手动录入。</div>}
+        {!ctx.searchReady && <div className="callout">在「服务配置」填写 Tavily 搜索密钥后即可联网搜索。已有网页链接也可以手动录入。</div>}
         <ErrorBox message={action.error} />
         <div className="button-group"><button className="btn primary" disabled={!ctx.searchReady || action.busy || !query.trim()}><Search size={16} />{action.busy ? '正在处理…' : '联网搜索'}</button>
           <button className="btn secondary" type="button" disabled={!chapterId || action.busy} onClick={() => setDraft({ source: { title: '', url: '', snippet: '' } })}><Plus size={16} /> 手动录入网络题</button>

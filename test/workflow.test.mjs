@@ -10,6 +10,48 @@ import { createApp } from '../server/main.mjs';
 import { localDay, shiftDay } from '../server/planner.mjs';
 import { createServices } from '../server/services.mjs';
 
+test('service settings take effect immediately and survive restart without returning keys', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'cert-prep-settings-'));
+  let runtime;
+  let server;
+  let base;
+  async function stop() {
+    if (!server) return;
+    runtime.jobs.stop();
+    await new Promise((resolve) => server.close(resolve));
+    runtime.store.close();
+    server = undefined;
+  }
+  t.after(async () => { await stop(); await rm(root, { recursive: true, force: true }); });
+  async function start() {
+    runtime = createApp({ root, demo: false });
+    server = runtime.app.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    base = 'http://127.0.0.1:' + server.address().port;
+  }
+  const settingsPath = '/api/settings/services';
+  const read = async () => (await fetch(base + settingsPath)).json();
+  const save = (body, origin = base) => fetch(base + settingsPath, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', Origin: origin },
+    body: JSON.stringify(body),
+  });
+  const aiBaseUrl = 'https://ai.example/v1';
+  const aiModel = 'test-model';
+  await start();
+  assert.equal((await save({ aiModel }, 'http://127.0.0.1:1')).status, 403);
+  assert.equal((await save({ aiBaseUrl: 'file:///settings' })).status, 400);
+  const saved = await save({ aiBaseUrl, aiModel, aiKey: 'test-ai-key', tavilyKey: 'test-search-key' });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await saved.json(), { aiBaseUrl, aiModel, hasAiKey: true, hasTavilyKey: true, aiReady: true, searchReady: true });
+  const workspace = await (await fetch(base + '/api/workspace')).json();
+  assert.equal(workspace.aiReady && workspace.searchReady, true);
+  assert.equal((await save({ aiModel: 'new-model', tavilyKey: null })).status, 200);
+  await stop();
+  await start();
+  assert.deepEqual(await read(), { aiBaseUrl, aiModel: 'new-model', hasAiKey: true, hasTavilyKey: false, aiReady: true, searchReady: false });
+});
+
 test('real local HTTP workflow survives errors, duplicate submissions and restart', { timeout: 30000 }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'cert-prep-workflow-'));
   let runtime;

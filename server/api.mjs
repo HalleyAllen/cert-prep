@@ -45,7 +45,7 @@ function cleanFilename(raw) {
   return filename.replace(/[\x00-\x1f\x7f/\\]/g, '_').trim();
 }
 
-export function createApi(store, root, services, jobs) {
+export function createApi(store, root, services, jobs, settings) {
   const api = express.Router();
   const owned = express.Router({ mergeParams: true });
   const upload = multer({
@@ -65,7 +65,7 @@ export function createApi(store, root, services, jobs) {
     JOIN courses co ON co.id=ch.course_id WHERE q.id=? AND co.certificate_id=?`, [req.params.questionId, cert(req).id], '题目');
   const nextPosition = (table, key, id) => store.get(`SELECT COALESCE(MAX(position), 0) + 1 AS next FROM ${table} WHERE ${key}=?`, id).next;
   const requireAI = () => {
-    if (!services.aiReady) throw new Problem(503, '请在 .env 配置模型地址、名称和密钥后重启服务。');
+    if (!services.aiReady) throw new Problem(503, '请在「服务配置」填写模型地址、名称和密钥。');
   };
   const runJob = (res, certificate, kind, target, input) => {
     const jobId = jobs.enqueue(certificate.id, kind, target, input);
@@ -75,6 +75,18 @@ export function createApi(store, root, services, jobs) {
 
   api.get('/workspace', (_req, res) => res.json({ today: localDay(), aiReady: services.aiReady, searchReady: services.searchReady,
     certificates: store.all('SELECT * FROM certificates WHERE owner=? ORDER BY demo ASC, updated_at DESC, id', owner).map(toCertificate) }));
+
+  const serviceView = () => ({ ...settings.read(), aiReady: services.aiReady, searchReady: services.searchReady });
+  api.get('/settings/services', (_req, res) => res.json(serviceView()));
+  api.patch('/settings/services', (req, res) => {
+    const origin = req.get('Origin');
+    if (origin && origin !== req.protocol + '://' + req.get('Host')) {
+      throw new Problem(403, '请在备考台页面修改服务配置。');
+    }
+    if (!req.is('application/json')) throw new Problem(415, '服务配置需要使用 JSON 格式。');
+    settings.save(req.body);
+    res.json(serviceView());
+  });
 
   api.post('/certificates', (req, res) => {
     const data = validated(z.object({ name: str(100), course: str(100).default('默认科目'), examDate: editableDate }), req.body);

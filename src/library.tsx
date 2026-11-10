@@ -1,7 +1,8 @@
 import { ArrowLeft, ArrowRight, BookOpen, Check, ChevronDown, ChevronRight, Download, ExternalLink, FilePlus2, FileText, PenLine, Plus, Search, Sparkles, Trash2, UploadCloud } from 'lucide-react';
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, fileURL, isActive, materialLabels, studyChapters, unitLabel, type Chapter, type ChapterDetail, type Context, type Draft, type Job, type MaterialCategory, type MaterialDetail, type Unit } from './model';
 import { DraftEditor } from './practice';
+import { ReadingFlow, UnitText, focusReaderItem } from './reader';
 import { Empty, ErrorBox, Heading, JobLine, Loading, Modal, useAction, useResource } from './ui';
 
 const materialUploadLimitMB = 500;
@@ -167,55 +168,13 @@ function DeleteUnitDialog({ unit, remove, close }: { unit: Unit; remove: () => P
   </Modal>;
 }
 
-function markedText(unit: Unit, start: number, end: number) {
-  const parts: ReactNode[] = [];
-  let offset = start;
-  for (const mark of unit.marks ?? []) {
-    const first = Math.max(mark.start, start);
-    const last = Math.min(mark.end, end);
-    if (first < offset || last <= first) continue;
-    parts.push(unit.text.slice(offset, first));
-    parts.push(<span key={first} style={{ color: mark.color, backgroundColor: mark.background,
-      textDecoration: mark.underline ? 'underline' : undefined }}>{unit.text.slice(first, last)}</span>);
-    offset = last;
-  }
-  parts.push(unit.text.slice(offset, end));
-  return parts;
-}
-
-const visualLabel = { figure: '插图', formula: '公式', table: '表格' };
-
-function UnitText({ unit, base, materialId }: { unit: Unit; base: string; materialId: string }) {
-  const visuals = (unit.visuals ?? []).map((visual, index) => ({ ...visual, index, offset: unit.text.indexOf(visual.anchor) }))
-    .filter((visual) => visual.offset >= 0).sort((a, b) => a.offset - b.offset);
-  if (!visuals.length) return <p>{markedText(unit, 0, unit.text.length)}</p>;
-  const parts: ReactNode[] = [];
-  let start = 0;
-  const addText = (end: number) => {
-    while (start < end && unit.text[start] === '\n') start += 1;
-    while (end > start && unit.text[end - 1] === '\n') end -= 1;
-    if (end > start) parts.push(<p key={`text-${start}`}>{markedText(unit, start, end)}</p>);
-  };
-  for (const visual of visuals) {
-    addText(visual.offset);
-    const src = `${base}/materials/${materialId}/units/${unit.position}/visuals/${visual.index}`;
-    parts.push(<figure className="unit-visual" key={`visual-${visual.index}`}>
-      <a href={fileURL(base, materialId, unit.page)} target="_blank" rel="noreferrer">
-        <img src={src} loading="lazy" decoding="async" alt={`第 ${unit.page} 页${visualLabel[visual.kind]}`} />
-      </a>
-      <figcaption>{visualLabel[visual.kind]} · PDF 第 {unit.page} 页</figcaption>
-    </figure>);
-    start = visual.offset + visual.anchor.length;
-  }
-  addText(unit.text.length);
-  return <div className="unit-content">{parts}</div>;
-}
-
 export function MaterialPage({ ctx, id }: { ctx: Context; id?: string }) {
   const latest = ctx.data.jobs.find((item) => item.target_id === id && item.kind === 'import');
   const resource = useResource<MaterialDetail>(`${ctx.base}/materials/${id}`, `${latest?.id}:${latest?.status}`);
   const action = useAction();
   const [page, setPage] = useState(0);
+  const [correcting, setCorrecting] = useState(false);
+  const [readingChapter, setReadingChapter] = useState('');
   const [editing, setEditing] = useState<Unit>();
   const [deletingUnit, setDeletingUnit] = useState<Unit>();
   const [adding, setAdding] = useState(false);
@@ -226,10 +185,14 @@ export function MaterialPage({ ctx, id }: { ctx: Context; id?: string }) {
   const category = ctx.data.materials.find((item) => item.id === material.id)?.category ?? material.category;
   const job = latest || material.job;
   const chapters = ctx.data.chapters.filter((chapter) => chapter.material_id === material.id);
+  const selectedChapter = chapters.find((chapter) => chapter.id === readingChapter) ?? chapters[0];
+  const readingUnits = selectedChapter
+    ? material.units.filter((unit) => unit.position >= selectedChapter.start_unit && unit.position <= selectedChapter.end_unit)
+    : material.units;
   const size = 12;
   const visiblePage = Math.min(page, Math.max(0, Math.ceil(material.units.length / size) - 1));
   return <div className="screen"><button className="back" onClick={() => ctx.go('materials')}><ArrowLeft size={17} /> 返回资料库</button>
-    <Heading kicker={`${materialLabels[category]} / 原文校对`} title={material.name} note="校对文字并记录原文位置。章节范围用片段编号设置。"
+    <Heading kicker={`${materialLabels[category]} / 资料阅读`} title={material.name} note="按原书小节阅读，也可切换到片段校对。"
       action={<div className="button-group">
         <button className="btn secondary" disabled={action.busy} onClick={() => void action.run(async () => {
           const next = category === 'textbook' ? 'supplement' : 'textbook';
@@ -242,7 +205,20 @@ export function MaterialPage({ ctx, id }: { ctx: Context; id?: string }) {
       </div>} />
     <ErrorBox message={action.error} />
     {job && <JobLine job={job} retry={() => retryJob(ctx, action, job)} cancel={() => cancelImport(ctx, action, job)} />}
-    {!!material.extracted && <div className="split-layout reversed"><section className="card panel"><div className="panel-head"><div><h2>原文片段</h2><p>{material.units.length} 个片段 · 可直接校对识别文字</p></div></div>
+    {!!material.extracted && <div className="split-layout reversed"><section className="card panel">
+      <div className="panel-head"><div><h2>{correcting ? '原文片段' : '资料原文'}</h2><p>{correcting ? `${material.units.length} 个片段 · 可直接校对识别文字` : '按原书编号连续阅读'}</p></div></div>
+      <div className="button-group reader-modes" role="group" aria-label="资料查看方式">
+        <button type="button" className={`btn ${correcting ? 'secondary' : 'primary'}`} aria-pressed={!correcting} onClick={() => setCorrecting(false)}>按小节阅读</button>
+        <button type="button" className={`btn ${correcting ? 'primary' : 'secondary'}`} aria-pressed={correcting} onClick={() => setCorrecting(true)}>片段校对</button>
+      </div>
+      {!correcting && <>
+        {chapters.length > 1 && <label className="reader-chapter-select">阅读章节<select value={selectedChapter?.id} onChange={(event) => setReadingChapter(event.target.value)}>
+          {chapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapter.title}</option>)}
+        </select></label>}
+        {readingUnits.length ? <ReadingFlow key={selectedChapter?.id ?? material.id} units={readingUnits} base={ctx.base} materialId={material.id} chapterTitle={selectedChapter?.title} />
+          : <p className="muted">暂无可阅读的原文，可切换到片段校对查看。</p>}
+      </>}
+      {correcting && <>
       {!material.units.length && <p className="muted">没有剩余的原文片段，可下载原文件查看。</p>}
       <div className="units">{material.units.slice(visiblePage * size, (visiblePage + 1) * size).map((unit) => <div className="unit" key={unit.position}>
         <div className="unit-head"><strong>{unitLabel(unit)}</strong>{unit.method === 'ocr' && <span className="pill">OCR</span>}
@@ -256,9 +232,10 @@ export function MaterialPage({ ctx, id }: { ctx: Context; id?: string }) {
       </div>)}</div>
       {material.units.length > size && <div className="pagination"><button className="btn secondary small" disabled={!visiblePage} onClick={() => setPage(visiblePage - 1)}>上一组</button>
         <span>{visiblePage + 1} / {Math.ceil(material.units.length / size)}</span><button className="btn secondary small" disabled={(visiblePage + 1) * size >= material.units.length} onClick={() => setPage(visiblePage + 1)}>下一组</button></div>}
+      </>}
     </section><section className="card panel"><div className="panel-head"><div><h2>资料章节</h2><p>{chapters.length} 章 · 可调整自动建议的范围</p></div></div>
       <ul className="record-list">{chapters.map((chapter) => <li key={chapter.id}><button className="record-row compact" onClick={() => ctx.go('chapter', chapter.id)}>
-        <div><strong>{chapter.title}</strong><small>片段 {chapter.start_unit}–{chapter.end_unit}</small></div><ChevronRight size={16} />
+        <div><strong>{chapter.title}</strong>{correcting && <small>片段 {chapter.start_unit}–{chapter.end_unit}</small>}</div><ChevronRight size={16} />
       </button></li>)}</ul><button className="btn secondary" disabled={!material.units.length} onClick={() => setAdding(true)}><Plus size={16} /> 新建章节</button>
     </section></div>}
     {deleting && <DeleteMaterialDialog ctx={ctx} material={material} close={() => setDeleting(false)} />}
@@ -351,21 +328,14 @@ export function ChapterPage({ ctx, id }: { ctx: Context; id?: string }) {
   const resource = useResource<ChapterDetail>(`${ctx.base}/chapters/${id}`, currentJobs.map((job) => `${job?.id}:${job?.status}`).join(','));
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState<Draft>();
-  const [sourcePage, setSourcePage] = useState(0);
   const [activeUnit, setActiveUnit] = useState<number>();
   const [questionCount, setQuestionCount] = useState(5);
   const action = useAction();
   const { base, refresh } = ctx;
   useEffect(() => { if (id) void api(`${base}/chapters/${id}/visit`, 'POST').then(refresh).catch(() => {}); }, [base, id, refresh]);
-  useEffect(() => {
-    if (activeUnit === undefined) return;
-    const element = document.getElementById(`unit-${activeUnit}`);
-    element?.scrollIntoView({ block: 'center' }); element?.focus({ preventScroll: true });
-  }, [activeUnit, sourcePage]);
   const chapter = resource.value;
   if (resource.error) return <ErrorBox message={resource.error} retry={resource.reload} />;
   if (!chapter) return <Loading />;
-  const chunk = 8;
   const startAI = (kind: 'analyze' | 'generate') => void action.run(async () => {
     await api(`${base}/chapters/${chapter.id}/${kind}`, 'POST', kind === 'generate' ? { count: questionCount } : undefined);
     await ctx.refresh(); ctx.notify('AI 任务已加入队列');
@@ -386,21 +356,17 @@ export function ChapterPage({ ctx, id }: { ctx: Context; id?: string }) {
         {section.points.map((point, pointIndex) => <article className="point" key={pointIndex}><span className={`pill ${point.kind === 'focus' ? 'amber' : 'green'}`}>
           {({ key: '知识点', focus: '复习重点', confusion: '易混点' })[point.kind]}</span><strong>{point.title}</strong><p>{point.explanation}</p>
           {point.units.length > 0 && <div className="citation-list">{point.units.map((position) => {
-            const index = chapter.units.findIndex((unit) => unit.position === position);
-            if (index === -1) return null;
+            const unit = chapter.units.find((item) => item.position === position);
+            if (!unit) return null;
             return <button className="citation" key={position} onClick={() => {
-              setSourcePage(Math.floor(index / chunk)); setActiveUnit(position);
-              const target = document.getElementById(`unit-${position}`); target?.scrollIntoView({ block: 'center' }); target?.focus({ preventScroll: true });
-            }}>{unitLabel(chapter.units[index])}</button>;
+              setActiveUnit(position);
+              focusReaderItem(`unit-${position}`);
+            }}>{unit.page ? `原文第 ${unit.page} 页` : '查看引用原文'}</button>;
           })}</div>}</article>)}
-      </div>)}</div> : <Empty icon={<Sparkles size={24} />} title="等待生成章节分析" note={!chapter.units.length ? '本章没有原文片段，可在「编辑章节」中重新选择。' : ctx.aiReady ? '点击「分析本章」将本章校对后的文字发送至配置的模型。' : '在 .env 配置 AI 模型后，就可以根据原文生成分析。'} />}
-    </section><section className="card panel"><div className="panel-head"><div><h2><BookOpen size={19} /> 章节原文</h2><p>{chapter.units.length ? `片段 ${chapter.start_unit}–${chapter.end_unit}` : '暂无原文片段'}</p></div>
+      </div>)}</div> : <Empty icon={<Sparkles size={24} />} title="等待生成章节分析" note={!chapter.units.length ? '本章没有原文片段，可在「编辑章节」中重新选择。' : ctx.aiReady ? '点击「分析本章」将本章校对后的文字发送至配置的模型。' : '在「服务配置」填写 AI 模型信息后，就可以根据原文生成分析。'} />}
+    </section><section className="card panel"><div className="panel-head"><div><h2><BookOpen size={19} /> 章节原文</h2><p>{chapter.units.length ? '按原书编号连续阅读' : '暂无原文'}</p></div>
       <button className="btn secondary small" onClick={() => ctx.go('material', chapter.material_id)}><PenLine size={14} /> 校对资料</button></div>
-      <div className="units">{chapter.units.slice(sourcePage * chunk, (sourcePage + 1) * chunk).map((unit) => <article tabIndex={-1} id={`unit-${unit.position}`} key={unit.position}
-        className={`unit ${activeUnit === unit.position ? 'highlight' : ''}`}><div className="unit-head"><strong>{unitLabel(unit)}</strong>
-          <a className="mini-link" href={fileURL(base, chapter.material_id, chapter.extension === '.pdf' ? unit.page : null)} target="_blank" rel="noreferrer">原文件 <ExternalLink size={13} /></a></div><UnitText unit={unit} base={base} materialId={chapter.material_id} /></article>)}</div>
-      {chapter.units.length > chunk && <div className="pagination"><button className="btn small secondary" disabled={!sourcePage} onClick={() => { setActiveUnit(undefined); setSourcePage(sourcePage - 1); }}>上一组</button>
-        <span>{sourcePage + 1} / {Math.ceil(chapter.units.length / chunk)}</span><button className="btn small secondary" disabled={(sourcePage + 1) * chunk >= chapter.units.length} onClick={() => { setActiveUnit(undefined); setSourcePage(sourcePage + 1); }}>下一组</button></div>}
+      {!!chapter.units.length && <ReadingFlow units={chapter.units} base={base} materialId={chapter.material_id} chapterTitle={chapter.title} activeUnit={activeUnit} />}
     </section></div><aside className="stack"><section className="card panel stack chapter-tools"><div className="panel-head"><div><h2>本章练习</h2><p>{chapter.question_count} 道已加入的练习题</p></div></div>
       {chapter.learned_at ? <span className="pill green status-self"><Check size={14} /> 本章已学</span> : <button className="btn secondary" disabled={action.busy} onClick={() => void action.run(async () => {
         await api(`${base}/chapters/${chapter.id}/learn`, 'POST'); resource.reload(); await ctx.refresh(); ctx.notify('已标记本章学完');

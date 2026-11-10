@@ -1,11 +1,12 @@
 import { StrictMode, useCallback, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { BookOpen, CalendarDays, Check, ChevronDown, CircleHelp, Files, GraduationCap, House, ListChecks, Plus, Search, Settings2, WifiOff, X } from 'lucide-react';
+import { BookOpen, CalendarDays, Check, ChevronDown, CircleHelp, Files, GraduationCap, House, ListChecks, Plus, Search, Settings2, X } from 'lucide-react';
 import { api, isActive, type Context, type Navigate, type Screen, type Snapshot, type Workspace } from './model';
 import { ErrorBox, Loading, Modal, useAction } from './ui';
 import { Dashboard, PlanPage } from './dashboard';
 import { ChapterPage, ChaptersPage, MaterialPage, MaterialsPage } from './library';
 import { MistakesPage, QuizPage, SearchPage } from './practice';
+import { ServiceSettingsDialog } from './service-settings';
 import './styles.css';
 
 const nav = [
@@ -121,7 +122,7 @@ function App() {
     <div className="body-shell">
       <header className="topbar"><div className="crumb"><span>工作区</span><span>/</span><strong>{labels[route.page]}</strong></div>
         <div className="top-actions">{cert?.demo && <span className="pill demo-pill">示例工作区</span>}
-          <button className="icon-button top-help" aria-label="查看服务配置" onClick={() => setDialog('settings')}><CircleHelp size={19} /></button></div>
+          <button className="icon-button top-help" aria-label="打开服务配置" onClick={() => setDialog('settings')}><CircleHelp size={19} /></button></div>
       </header>
       <main id="main-content" tabIndex={-1} className="main-content" ref={main}>
         <ErrorBox message={loadError} retry={retry} />
@@ -129,13 +130,11 @@ function App() {
       </main>
     </div>
     {notice && <div className="toast" role="status"><Check size={18} />{notice}<button className="icon-button" aria-label="关闭提示" onClick={() => setNotice('')}><X size={16} /></button></div>}
-    {dialog === 'settings' && <Modal title="服务配置" onClose={() => setDialog(null)}><div className="stack config-info">
-      <div><strong>AI 模型</strong><span className={`pill ${workspace?.aiReady ? 'green' : ''}`}>{workspace?.aiReady ? '已填写配置' : '待配置'}</span></div>
-      <div><strong>联网搜索 · Tavily</strong><span className={`pill ${workspace?.searchReady ? 'green' : ''}`}>{workspace?.searchReady ? '已填写配置' : '待配置'}</span></div>
-      <p><WifiOff size={17} /> 上传、OCR、计划与已有练习可在本机使用。配置服务请参阅项目的 README。</p>
-      <p>主动请求分析或生成练习时，章节正文会发送至配置的模型服务。联网搜题会将检索词发送至 Tavily。</p>
-      <button className="btn primary" onClick={() => setDialog(null)}>完成</button>
-    </div></Modal>}
+    {dialog === 'settings' && <ServiceSettingsDialog close={() => setDialog(null)} onSaved={(settings) => {
+      setWorkspace((current) => current && { ...current, ...settings });
+      setDialog(null);
+      setNotice('服务配置已保存');
+    }} />}
     {(dialog === 'new' || (dialog === 'edit' && cert)) && <CertificateForm current={dialog === 'edit' ? cert : undefined}
       today={workspace?.today || ''} close={() => setDialog(null)} onSaved={async (id) => {
         await loadWorkspace();
