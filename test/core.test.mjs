@@ -166,6 +166,31 @@ test('PDF layout restores paragraphs and preserves non-text page regions', () =>
   assert.ok(table.visuals[0].bounds.y1 > 0.51 && table.visuals[0].bounds.y1 < 0.55);
   assert.ok(table.lines.some((item) => item.text.startsWith('以下是保留')));
   assert.ok(!table.lines.some((item) => item.text === '方案甲' || item.text === '方案乙'));
+
+  const besideFigure = reflowPdfPage([
+    line('这一段正文跨过整页，说明下文的管理模型和信息处理过程。', 0.37),
+    line('左栏第一行是阅读区应该保留的正文。', 0.45, 0.14, 0.50),
+    line('左栏第二行也不能被放进右侧插图。', 0.48, 0.10, 0.51),
+    line('信息处理', 0.49, 0.62, 0.72),
+    line('左栏第三行仍然是连续排版的正文。', 0.51, 0.10, 0.50),
+    line('图1-2 信息系统抽象模型', 0.55, 0.63, 0.82),
+    line('图文之后的正文恢复通栏，继续说明管理模型和信息系统。', 0.59),
+  ]);
+  assert.ok(besideFigure.visuals[0].bounds.x0 > 0.51 && besideFigure.visuals[0].bounds.x0 < 0.54);
+  assert.match(besideFigure.lines.map(({ text }) => text).join('\n'), /左栏第一行.*左栏第二行.*左栏第三行/su);
+  assert.ok(!besideFigure.lines.some(({ text }) => text === '信息处理'));
+
+  const numbered = reflowPdfPage([
+    line('1， 信息及其特征', 0.20, 0.13, 0.36),
+    line('信息包含多个特征，其中包括客观性和普遍性。', 0.224),
+    line('2, 信息的质量属性', 0.248, 0.13, 0.36),
+    line('1，属于示例中的原始数值。', 0.272),
+  ]);
+  assert.deepEqual(numbered.lines.filter(({ text }) => text).map(({ text }) => text), [
+    '1. 信息及其特征', '信息包含多个特征，其中包括客观性和普遍性。', '2. 信息的质量属性', '1，属于示例中的原始数值。',
+  ]);
+  const [textUnit] = splitUnits('3， 信息传输模型\n1,000 个数据项。', null, 'text');
+  assert.equal(textUnit.text, '3. 信息传输模型\n1,000 个数据项。');
 });
 
 test('schedule preserves completed minutes, keeps daily capacity and leaves an overflow list', () => {
@@ -193,17 +218,41 @@ test('provider sanitizes citations, excludes material from search, and surfaces 
       return response({ results: [{ title: '公开题', url: 'https://exam.example/paper', content: '摘要' }, { title: '不安全', url: 'javascript:alert(1)' }] });
     }
     assert.equal(String(url), 'https://model.example/v1/chat/completions');
-    const input = JSON.parse(JSON.parse(options.body).messages[1].content);
+    const body = JSON.parse(options.body);
+    assert.equal(body.enable_thinking, undefined);
+    const input = JSON.parse(body.messages[1].content);
     assert.ok(input.units.every((unit) => unit.text.length <= 4200));
     return response({ choices: [{ message: { content: JSON.stringify({ summary: '章节摘要',
       points: [{ kind: 'key', title: '重要概念', explanation: '定义', units: [7, 999, 7] }] }) } }] });
   });
   const result = await services.analyze('范围', [{ position: 7, text: '原文。'.repeat(4000) }], () => {});
-  assert.equal(result.sections.length, 2);
+  assert.equal(result.sections.length, 3);
   assert.deepEqual(result.sections[0].points[0].units, [7]);
   assert.equal((await services.search('项目管理 试题')).length, 1);
   await assert.rejects(() => createServices({}).search('题'), /配置/);
   await assert.rejects(() => createServices(env, async () => { throw new DOMException('timeout', 'TimeoutError'); }).search('题'), /超时/);
   await assert.rejects(() => createServices(env, async () => response({ choices: [{ message: { content: 'bad' } }] }))
     .analyze('范围', [{ position: 1, text: '正文' }], () => {}), /格式/);
+
+  const lengths = [];
+  const progress = [];
+  const original = '原文。'.repeat(1800);
+  const recovered = await createServices({
+    ...env, AI_BASE_URL: 'https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', AI_MODEL: 'qwen3.8-27b',
+  }, async (_url, options) => {
+    const body = JSON.parse(options.body);
+    assert.equal(body.enable_thinking, false);
+    assert.equal(body.max_tokens, 2048);
+    assert.deepEqual(body.response_format, { type: 'json_object' });
+    const fragments = JSON.parse(body.messages[1].content).units;
+    assert.ok(fragments.every(({ id }) => id === 7));
+    const size = fragments.reduce((sum, { text }) => sum + text.length, 0);
+    lengths.push(size);
+    if (lengths.length === 1) return { ok: true, status: 200, json: async () => { throw new DOMException('timeout', 'AbortError'); } };
+    return response({ choices: [{ message: { content: '{"summary":"摘要","points":[{"kind":"核心知识点","title":"要点","explanation":"解释","units":["7","999"]}]}' } }] });
+  }).analyze('范围', [{ position: 7, text: original }], (_percent, message) => progress.push(message));
+  assert.deepEqual(lengths, [original.length, 3150, original.length - 3150]);
+  assert.equal(recovered.sections.length, 2);
+  assert.deepEqual(recovered.sections[0].points[0], { kind: 'key', title: '要点', explanation: '解释', units: [7] });
+  assert.ok(progress.some((message) => message.includes('正在重试')));
 });

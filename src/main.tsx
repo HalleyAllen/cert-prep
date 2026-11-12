@@ -1,4 +1,4 @@
-import { StrictMode, useCallback, useEffect, useRef, useState } from 'react';
+import { StrictMode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BookOpen, CalendarDays, Check, ChevronDown, CircleHelp, Files, GraduationCap, House, ListChecks, Plus, Search, Settings2, X } from 'lucide-react';
 import { api, isActive, type Context, type Navigate, type Screen, type Snapshot, type Workspace } from './model';
@@ -7,6 +7,7 @@ import { Dashboard, PlanPage } from './dashboard';
 import { ChapterPage, ChaptersPage, MaterialPage, MaterialsPage } from './library';
 import { MistakesPage, QuizPage, SearchPage } from './practice';
 import { ServiceSettingsDialog } from './service-settings';
+import { readReadingProgress } from './reading-progress';
 import './styles.css';
 
 const nav = [
@@ -32,6 +33,7 @@ function App() {
   const [dialog, setDialog] = useState<'new' | 'edit' | 'settings' | null>(null);
   const main = useRef<HTMLElement>(null);
   const requestVersion = useRef(0);
+  const resumeOnOpen = useRef(!location.hash);
   const lastId = useRef(certId);
   lastId.current = certId;
   const go: Navigate = (page, id) => {
@@ -43,6 +45,17 @@ function App() {
     window.addEventListener('hashchange', change);
     return () => window.removeEventListener('hashchange', change);
   }, []);
+  useLayoutEffect(() => {
+    if (!resumeOnOpen.current || data?.certificate.id !== certId) return;
+    resumeOnOpen.current = false;
+    if (location.hash) return;
+    const hash = readReadingProgress('/api/certificates/' + certId + '/last-page');
+    const [, page, id] = /^#(chapter|material)\/([^/]+)$/.exec(hash) ?? [];
+    const items = page === 'chapter' ? data.chapters : page === 'material' ? data.materials : [];
+    if (!items.some((item) => item.id === id)) return;
+    history.replaceState(history.state, '', hash);
+    setRoute(getRoute());
+  }, [certId, data]);
   const loadWorkspace = useCallback(async () => {
     const result = await api<Workspace>('/api/workspace');
     setWorkspace(result);

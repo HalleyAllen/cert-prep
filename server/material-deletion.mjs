@@ -14,9 +14,8 @@ export function cleanupUpload(store, root, key) {
   return true;
 }
 
-function removeDeletedQuestions(store, certificateId, materialId) {
-  const ids = new Set(store.all(`SELECT q.id FROM questions q JOIN chapters ch ON ch.id=q.chapter_id
-    WHERE ch.material_id=?`, materialId).map(({ id }) => id));
+function removeDeletedQuestions(store, certificateId, questionsToDelete) {
+  const ids = new Set(questionsToDelete.map(({ id }) => id));
   if (!ids.size) return;
   const attempts = store.all("SELECT id, questions, result FROM attempts WHERE certificate_id=? AND mode='mistake'", certificateId);
   for (const attempt of attempts) {
@@ -38,6 +37,32 @@ function removeDeletedQuestions(store, certificateId, materialId) {
   }
 }
 
+function removeUnscheduledChapters(store, certificate, chaptersToDelete) {
+  if (!certificate.plan_settings) return;
+  const plan = parse(certificate.plan_settings);
+  const ids = new Set(chaptersToDelete.map(({ id }) => id));
+  const unscheduled = plan.unscheduled?.filter((task) => !ids.has(task.chapterId));
+  if (unscheduled && unscheduled.length !== plan.unscheduled.length) {
+    store.run('UPDATE certificates SET plan_settings=? WHERE id=?',
+      JSON.stringify({ ...plan, unscheduled }), certificate.id);
+  }
+}
+
+export function deleteChapter(store, certificate, chapter) {
+  store.transaction(() => {
+    const relatedJobs = "certificate_id=? AND target_id=? AND kind IN ('analyze','generate')";
+    const params = [certificate.id, chapter.id];
+    if (store.get(`SELECT 1 FROM jobs WHERE ${relatedJobs} AND status IN ('queued','running') LIMIT 1`, ...params)) {
+      throw new Problem(409, '本章正在等待分析或出题，请等任务结束后再删除。');
+    }
+    removeDeletedQuestions(store, certificate.id, store.all('SELECT id FROM questions WHERE chapter_id=?', chapter.id));
+    removeUnscheduledChapters(store, certificate, [chapter]);
+    store.run(`DELETE FROM jobs WHERE ${relatedJobs}`, ...params);
+    store.run('DELETE FROM chapters WHERE id=?', chapter.id);
+  });
+  return { ok: true };
+}
+
 export function deleteMaterial(store, root, certificate, material) {
   store.transaction(() => {
     const relatedJobs = `certificate_id=? AND ((kind='import' AND target_id=?)
@@ -48,16 +73,9 @@ export function deleteMaterial(store, root, certificate, material) {
       ? '请先取消这份资料的导入，再删除。'
       : '这份资料的章节正在等待分析或出题，请等任务结束后再删除。');
 
-    removeDeletedQuestions(store, certificate.id, material.id);
-    if (certificate.plan_settings) {
-      const plan = parse(certificate.plan_settings);
-      const chapterIds = new Set(store.all('SELECT id FROM chapters WHERE material_id=?', material.id).map(({ id }) => id));
-      const unscheduled = plan.unscheduled?.filter((task) => !chapterIds.has(task.chapterId));
-      if (unscheduled && unscheduled.length !== plan.unscheduled.length) {
-        store.run('UPDATE certificates SET plan_settings=? WHERE id=?',
-          JSON.stringify({ ...plan, unscheduled }), certificate.id);
-      }
-    }
+    removeDeletedQuestions(store, certificate.id, store.all(`SELECT q.id FROM questions q JOIN chapters ch ON ch.id=q.chapter_id
+      WHERE ch.material_id=?`, material.id));
+    removeUnscheduledChapters(store, certificate, store.all('SELECT id FROM chapters WHERE material_id=?', material.id));
     store.run(`DELETE FROM jobs WHERE ${relatedJobs}`, ...params);
     store.run('DELETE FROM materials WHERE id=?', material.id);
     store.run('INSERT OR IGNORE INTO deleted_uploads(file_key) VALUES (?)', material.file_key);

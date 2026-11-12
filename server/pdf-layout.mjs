@@ -1,5 +1,6 @@
 import { isChapterHeading } from './text-cleanup.mjs';
 import { editMarks, joinMarked, trimMarked } from './rich-text.mjs';
+import { normalizeNumberedHeading } from '../shared/numbered-heading.mjs';
 
 const han = /\p{Script=Han}/u;
 const section = /^(?:\d+(?:\s*\.\s*\d+)+\s*(?=[\p{L}])|\d+[.、]\s*(?=\p{Script=Han}))/u;
@@ -28,7 +29,7 @@ function cleanSpacing(line) {
     text = text.slice(0, match.index) + text.slice(end);
     marks = editMarks(marks, match.index, end, 0);
   }
-  return { ...line, text, marks };
+  return { ...line, text: normalizeNumberedHeading(text), marks };
 }
 
 export function pdfTableRules(canvas, lines) {
@@ -53,6 +54,30 @@ export function pdfTableRules(canvas, lines) {
     }
   }
   return rules;
+}
+
+function figureColumn(nearby, label, left, right) {
+  const center = (label.bounds.x0 + label.bounds.x1) / 2;
+  const relativeCenter = (center - left) / (right - left);
+  const figureOnRight = relativeCenter > 0.63;
+  if (!figureOnRight && relativeCenter >= 0.37) return null;
+
+  const before = Math.max(label.bounds.y0 - 0.56, ...nearby
+    .filter((line) => widthOf(line) > 0.48 && line.text.length >= 20)
+    .map((line) => line.bounds.y1));
+  const side = nearby.filter((line) => {
+    const { x0, x1, y0 } = line.bounds;
+    return !line.edge && y0 >= before && widthOf(line) >= 0.22 && line.text.length >= 12
+      && !caption.test(line.text)
+      && (figureOnRight ? x0 < left + 0.08 && x1 < label.bounds.x0 - 0.02
+        : x1 > right - 0.08 && x0 > label.bounds.x1 + 0.02);
+  });
+  const edges = side.map(({ bounds }) => figureOnRight ? bounds.x1 : bounds.x0);
+  if (edges.length < 3 || label.bounds.y0 - Math.max(...side.map(({ bounds }) => bounds.y1)) > 0.08) return null;
+  const typicalEdge = quantile(edges, 0.5);
+  if (edges.filter((edge) => Math.abs(edge - typicalEdge) < 0.025).length < 3) return null;
+  return figureOnRight ? { x0: Math.max(...edges) + 0.008, x1: right + 0.04 }
+    : { x0: left - 0.04, x1: Math.min(...edges) - 0.008 };
 }
 
 function readVisuals(lines, left, right, rules) {
@@ -93,13 +118,19 @@ function readVisuals(lines, left, right, rules) {
       continue;
     }
     const nearby = lines.filter((item) => item.bounds && item !== line && item.bounds.y1 < line.bounds.y0);
-    const prose = nearby.filter((item) => !item.edge && isProse(item));
-    const y0 = Math.max(0.04, ...prose.map((item) => item.bounds.y1)) + 0.004;
+    const column = figureColumn(nearby, line, left, right);
+    const horizontal = column ?? { x0: left - 0.04, x1: right + 0.04 };
+    const inColumn = ({ bounds }) => (bounds.x0 + bounds.x1) / 2 > horizontal.x0
+      && (bounds.x0 + bounds.x1) / 2 < horizontal.x1;
+    const prose = nearby.filter((item) => !item.edge && isProse(item)
+      && (!column || (item.bounds.x1 > column.x0 && item.bounds.x0 < column.x1)));
+    const y0 = Math.max(0.04, ...prose.map((item) => item.bounds.y1)) + (column ? 0.008 : 0.004);
     const y1 = line.bounds.y0 - 0.004;
     if (y1 - y0 < 0.04 || y1 - y0 > 0.56 || !prose.length) continue;
-    const contained = nearby.filter((item) => midpoint(item) > y0 && midpoint(item) < y1 && !isChapterHeading(item.text));
+    const contained = nearby.filter((item) => midpoint(item) > y0 && midpoint(item) < y1
+      && (!column || inColumn(item)) && !isChapterHeading(item.text));
     if (contained.some((item) => caption.test(item.text))) continue;
-    insert(line, 'figure', { x0: left - 0.04, x1: right + 0.04, y0, y1 });
+    insert(line, 'figure', { ...horizontal, y0, y1 });
     for (const item of contained) omitted.add(item);
   }
   for (const line of geometry) {

@@ -10,6 +10,7 @@ import { editMarks, joinMarked, sliceMarks, trimMarked } from './rich-text.mjs';
 import { createPageSampler } from './page-marks.mjs';
 import { normalizedPdfBounds, pdfTableRules, reflowPdfPage } from './pdf-layout.mjs';
 import { readWordMarks } from './word-marks.mjs';
+import { normalizeNumberedHeading } from '../shared/numbered-heading.mjs';
 import { applyPdfOutline, chapterLabel, isContentsEntry, isReferenceHeading, pdfChapterOutline } from './pdf-structure.mjs';
 
 const require = createRequire(import.meta.url);
@@ -39,6 +40,7 @@ export function splitUnits(text, page, method, marks = [], detectHeadings = true
   let offset = 0;
   for (const raw of text.replace(/\r\n?/g, '\n').split('\n')) {
     const line = trimMarked({ text: raw, marks: sliceMarks(marks, offset, offset + raw.length) }, Boolean(visuals));
+    line.text = normalizeNumberedHeading(line.text);
     if (detectHeadings && isChapterHeading(line.text) && !isContentsEntry(line.text)) {
       flush();
       heading = line.text.replace(/^#+\s*/, '');

@@ -1,14 +1,17 @@
 import type { Unit, UnitVisual } from './model';
+import { normalizeNumberedHeading } from '../shared/numbered-heading.mjs';
 
 export type ReadingPart = { unit: Unit; start: number; end: number; gap: string; first: boolean };
 export type ReadingBlock =
-  | { kind: 'paragraph'; parts: ReadingPart[] }
+  | { kind: 'paragraph'; parts: ReadingPart[]; indent: boolean }
   | { kind: 'heading'; part: ReadingPart; title: string; depth: number; local?: boolean }
-  | { kind: 'visual'; part: ReadingPart; visual: UnitVisual; index: number };
+  | { kind: 'visual'; part: ReadingPart; visual: UnitVisual; index: number; caption?: ReadingPart };
 
 const chineseChapter = /^第\s*([一二三四五六七八九十百零〇两\d]+)\s*章/u;
 const englishChapter = /^chapter\s+(\d+)\b/iu;
-const listStart = /^(?:[●•▪◆]|[（(]\s*\d+\s*[）)]|\d+[.、)]\s*(?!\d))/u;
+const indentedItem = /^(?:[●•▪◆]|[（(]\s*[\d０-９]+\s*[）)])/u;
+const figureCaption = /^(?:图|figure)\s*\d+(?:\s*[-–—－.．]\s*\d+)+\s*\p{L}/iu;
+const listStart = /^\d+[.、)]\s*(?!\d)/u;
 const stops = /[。！？；.!?;：:][」』”’）)]*$/u;
 const hasHan = /\p{Script=Han}/u;
 
@@ -55,7 +58,10 @@ export function buildReadingFlow(units: Unit[], chapterTitle = ''): ReadingBlock
   const selectedNumber = chapterNumber(chapterTitle);
   let currentNumber = selectedNumber;
   let parentDepth = 0;
-  for (const unit of units) {
+  for (const source of units) {
+    // Keep source offsets intact so highlights and notes still point at the saved text.
+    const text = source.text.replace(/[^\n]+/gu, normalizeNumberedHeading);
+    const unit = text === source.text ? source : { ...source, text };
     let first = true;
     let previousLineEnd = 0;
     const visuals = new Map((unit.visuals ?? []).map((visual, index) => [visual.anchor, { visual, index }]));
@@ -66,11 +72,15 @@ export function buildReadingFlow(units: Unit[], chapterTitle = ''): ReadingBlock
       const start = match.index;
       const end = start + line.trimEnd().length;
       const part: ReadingPart = { unit, start, end, gap: '', first };
+      const previous = blocks.at(-1);
       const embedded = visuals.get(title);
       const heading = sourceHeading(line, currentNumber);
       const subheading = heading ? null : localHeading(line, parentDepth, unit.text.slice(previousLineEnd, start), unit.text.slice(end));
       if (embedded) {
         blocks.push({ kind: 'visual', part, ...embedded });
+      } else if (previous?.kind === 'visual' && previous.visual.kind === 'figure' && !previous.caption
+        && unit.page === previous.part.unit.page && figureCaption.test(title.normalize('NFKC'))) {
+        previous.caption = part;
       } else if (heading) {
         if (heading.depth === 1 && selectedNumber === undefined) currentNumber = chapterNumber(heading.title);
         parentDepth = heading.depth;
@@ -78,9 +88,9 @@ export function buildReadingFlow(units: Unit[], chapterTitle = ''): ReadingBlock
       } else if (subheading) {
         blocks.push({ kind: 'heading', part, ...subheading });
       } else {
-        const previous = blocks.at(-1);
         const last = previous?.kind === 'paragraph' ? previous.parts.at(-1) : undefined;
-        const newItem = /^\u3000{1,2}\S/u.test(line) || listStart.test(title);
+        const newItem = /^\u3000{1,2}\S/u.test(line) || indentedItem.test(title) || listStart.test(title);
+        const paragraph: ReadingBlock = { kind: 'paragraph', parts: [part], indent: indentedItem.test(line) };
         if (previous?.kind === 'paragraph' && last && !newItem) {
           const lastText = last.unit.text.slice(last.start, last.end).trimEnd();
           if (last.unit === unit && !/\n\s*\n/u.test(unit.text.slice(last.end, start))) {
@@ -89,8 +99,8 @@ export function buildReadingFlow(units: Unit[], chapterTitle = ''): ReadingBlock
           } else if (last.unit !== unit && first && !stops.test(lastText)) {
             part.gap = pageJoin(lastText, title);
             previous.parts.push(part);
-          } else blocks.push({ kind: 'paragraph', parts: [part] });
-        } else blocks.push({ kind: 'paragraph', parts: [part] });
+          } else blocks.push(paragraph);
+        } else blocks.push(paragraph);
       }
       first = false;
       previousLineEnd = end;

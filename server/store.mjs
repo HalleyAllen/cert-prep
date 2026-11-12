@@ -41,6 +41,12 @@ export function openStore(root) {
       practice_minutes INTEGER NOT NULL DEFAULT 10, analysis TEXT, analysis_hash TEXT,
       learned_at TEXT, practiced_at TEXT, visited_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS annotations (
+      id TEXT PRIMARY KEY, material_id TEXT NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+      position INTEGER NOT NULL, ranges TEXT NOT NULL, style TEXT NOT NULL, note TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS annotations_material ON annotations(material_id, created_at, id);
     CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY, certificate_id TEXT NOT NULL REFERENCES certificates(id) ON DELETE CASCADE,
       kind TEXT NOT NULL, target_id TEXT NOT NULL, input TEXT NOT NULL,

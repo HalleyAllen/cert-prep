@@ -8,7 +8,7 @@ import { localDay, saveSchedule, shiftDay, validDay } from './planner.mjs';
 import { now, owner, parse } from './store.mjs';
 import { correctMarks } from './rich-text.mjs';
 import { renderPdfVisual } from './pdf-visual.mjs';
-import { deleteMaterial } from './material-deletion.mjs';
+import { deleteChapter, deleteMaterial } from './material-deletion.mjs';
 import { selectStudyChapters } from './study-chapters.mjs';
 import { Problem, publicLink, questionInput, validated } from './services.mjs';
 import { chapterUnits, completeKind, insertQuestion, openAttempt, questionView, submitAttempt, withoutAnswer } from './study.mjs';
@@ -25,6 +25,17 @@ const searchSource = z.object({ url: str(2000).refine((url) => !!publicLink(url)
 export const materialUploadLimitMB = 500;
 const materialUploadLimitBytes = materialUploadLimitMB * 1024 * 1024;
 const materialCategory = z.enum(['textbook', 'supplement']);
+const annotationNote = z.string().trim().max(4000, '笔记最多 4000 个字符。');
+const annotationInput = z.object({
+  position: z.number().int().positive(),
+  ranges: z.array(z.object({
+    position: z.number().int().positive(), start: z.number().int().nonnegative(), quote: z.string().min(1).max(12000),
+  })).max(30),
+  style: z.enum(['underline', 'highlight']),
+  note: annotationNote,
+}).refine(({ ranges, note }) => ranges.length || note, '请选择原文或填写笔记。')
+  .refine(({ ranges }) => ranges.reduce((length, range) => length + range.quote.length, 0) <= 12000, '选中的文字太长，请分开标记。');
+const annotationView = ({ id, position, ranges, style, note }) => ({ id, position, ranges: parse(ranges), style, note });
 const supported = new Set(['.pdf', '.docx', '.txt', '.png', '.jpg', '.jpeg']);
 const toCertificate = ({ id, name, exam_date, demo, plan_settings }) => ({ id, name, examDate: exam_date, demo: !!demo,
   plan: plan_settings ? parse(plan_settings) : null });
@@ -187,6 +198,37 @@ export function createApi(store, root, services, jobs, settings) {
     res.json(deleteMaterial(store, root, cert(req), material(req)));
   });
 
+  const annotationPath = '/materials/:materialId/annotations';
+  owned.get(annotationPath, (req, res) => {
+    res.json(store.all('SELECT * FROM annotations WHERE material_id=? ORDER BY created_at DESC, id', material(req).id).map(annotationView));
+  });
+  owned.post(annotationPath, (req, res) => {
+    const { id: materialId } = material(req);
+    const data = validated(annotationInput, req.body);
+    const id = randomUUID();
+    const textAt = (position) => store.get('SELECT text FROM units WHERE material_id=? AND position=?', materialId, position)?.text;
+    if (data.ranges.length ? data.position !== data.ranges[0].position || data.ranges.some((range, index) =>
+      (index > 0 && range.position <= data.ranges[index - 1].position) ||
+      textAt(range.position)?.slice(range.start, range.start + range.quote.length) !== range.quote)
+      : textAt(data.position) === undefined) throw new Problem(409, '原文位置已变化，请刷新页面后重新选择。');
+    store.run('INSERT INTO annotations VALUES (?, ?, ?, ?, ?, ?, ?)', id, materialId, data.position,
+      JSON.stringify(data.ranges), data.style, data.note, now());
+    res.status(201).json({ id, ...data });
+  });
+  owned.patch(annotationPath + '/:annotationId', (req, res) => {
+    const row = find(store, 'SELECT * FROM annotations WHERE id=? AND material_id=?',
+      [req.params.annotationId, material(req).id], '笔记或标记');
+    const { note } = validated(z.object({ note: annotationNote }), req.body);
+    if (!note && !parse(row.ranges).length) throw new Problem(400, '请填写笔记内容。');
+    store.run('UPDATE annotations SET note=? WHERE id=?', note, row.id);
+    res.json(annotationView({ ...row, note }));
+  });
+  owned.delete(annotationPath + '/:annotationId', (req, res) => {
+    const result = store.run('DELETE FROM annotations WHERE id=? AND material_id=?', req.params.annotationId, material(req).id);
+    if (!result.changes) throw new Problem(404, '找不到笔记或标记。');
+    res.json({ ok: true });
+  });
+
   owned.get('/materials/:materialId/file', (req, res) => {
     const row = material(req);
     const file = join(root, 'uploads', row.file_key);
@@ -286,6 +328,10 @@ export function createApi(store, root, services, jobs, settings) {
     store.run(`UPDATE chapters SET title=?, start_unit=?, end_unit=?, study_minutes=?, practice_minutes=?, analysis=?, analysis_hash=? WHERE id=?`,
       data.title, data.start, data.end, data.studyMinutes, data.practiceMinutes, stale ? null : row.analysis, stale ? null : row.analysis_hash, row.id);
     res.json({ ok: true });
+  });
+
+  owned.delete('/chapters/:chapterId', (req, res) => {
+    res.json(deleteChapter(store, cert(req), chapter(req)));
   });
 
   owned.post('/chapters/:chapterId/visit', (req, res) => {

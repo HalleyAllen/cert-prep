@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { api, fileURL, isActive, materialLabels, studyChapters, unitLabel, type Chapter, type ChapterDetail, type Context, type Draft, type Job, type MaterialCategory, type MaterialDetail, type Unit } from './model';
 import { DraftEditor } from './practice';
 import { ReadingFlow, UnitText, focusReaderItem } from './reader';
+import { readReadingProgress, writeReadingProgress } from './reading-progress';
 import { Empty, ErrorBox, Heading, JobLine, Loading, Modal, useAction, useResource } from './ui';
 
 const materialUploadLimitMB = 500;
@@ -174,7 +175,8 @@ export function MaterialPage({ ctx, id }: { ctx: Context; id?: string }) {
   const action = useAction();
   const [page, setPage] = useState(0);
   const [correcting, setCorrecting] = useState(false);
-  const [readingChapter, setReadingChapter] = useState('');
+  const chapterKey = ctx.base + '/material/' + id + '/last-chapter';
+  const [readingChapter, setReadingChapter] = useState(() => readReadingProgress(chapterKey));
   const [editing, setEditing] = useState<Unit>();
   const [deletingUnit, setDeletingUnit] = useState<Unit>();
   const [adding, setAdding] = useState(false);
@@ -212,10 +214,14 @@ export function MaterialPage({ ctx, id }: { ctx: Context; id?: string }) {
         <button type="button" className={`btn ${correcting ? 'primary' : 'secondary'}`} aria-pressed={correcting} onClick={() => setCorrecting(true)}>片段校对</button>
       </div>
       {!correcting && <>
-        {chapters.length > 1 && <label className="reader-chapter-select">阅读章节<select value={selectedChapter?.id} onChange={(event) => setReadingChapter(event.target.value)}>
+        {chapters.length > 1 && <label className="reader-chapter-select">阅读章节<select value={selectedChapter?.id} onChange={(event) => {
+          setReadingChapter(event.target.value);
+          writeReadingProgress(chapterKey, event.target.value);
+        }}>
           {chapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapter.title}</option>)}
         </select></label>}
-        {readingUnits.length ? <ReadingFlow key={selectedChapter?.id ?? material.id} units={readingUnits} base={ctx.base} materialId={material.id} chapterTitle={selectedChapter?.title} />
+        {readingUnits.length ? <ReadingFlow key={selectedChapter?.id ?? material.id} units={readingUnits} base={ctx.base} materialId={material.id}
+          chapterTitle={selectedChapter?.title} progressKey={'/material/' + material.id + '/' + (selectedChapter?.id ?? '')} />
           : <p className="muted">暂无可阅读的原文，可切换到片段校对查看。</p>}
       </>}
       {correcting && <>
@@ -263,6 +269,31 @@ export function MaterialPage({ ctx, id }: { ctx: Context; id?: string }) {
   </div>;
 }
 
+function DeleteChapterDialog({ ctx, chapter, close }: { ctx: Context; chapter: ChapterDetail; close: () => void }) {
+  const action = useAction();
+  const dismiss = () => { if (!action.busy) close(); };
+  return <Modal title="删除章节" onClose={dismiss}>
+    <form className="stack" onSubmit={(event) => {
+      event.preventDefault();
+      void action.run(async () => {
+        await api(ctx.base + '/chapters/' + chapter.id, 'DELETE');
+        const refreshed = await ctx.refresh().then(() => true, () => false);
+        close();
+        ctx.go('chapters');
+        ctx.notify(refreshed ? '章节已删除。' : '章节已删除，请刷新章节列表。');
+      });
+    }}>
+      <p className="delete-description">确定删除「<strong>{chapter.title}</strong>」？</p>
+      <p className="muted">本章的分析、练习、错题、学习进度和计划任务会一并删除。教材原文和原文笔记仍保存在资料库。</p>
+      <ErrorBox message={action.error} />
+      <div className="form-actions">
+        <button type="button" className="btn secondary" disabled={action.busy} onClick={dismiss} autoFocus>取消</button>
+        <button type="submit" className="btn danger" disabled={action.busy}>{action.busy ? '正在删除…' : '确认删除'}</button>
+      </div>
+    </form>
+  </Modal>;
+}
+
 function ChapterForm({ chapter, unitMin, unitMax, close, save }: { chapter?: ChapterDetail; unitMin: number | null; unitMax: number | null; close: () => void;
   save: (data: { title: string; start: number; end: number; studyMinutes: number; practiceMinutes: number }) => Promise<void> }) {
   const action = useAction();
@@ -292,12 +323,21 @@ export function ChaptersPage({ ctx, initialCourse }: { ctx: Context; initialCour
   const { data, go } = ctx;
   const [filter, setFilter] = useState(initialCourse || '');
   const [bySource, setBySource] = useState(false);
+  const [materialFilter, setMaterialFilter] = useState('');
   const courses = data.courses.filter((course) => !filter || filter === course.id);
+  const materials = data.materials.filter((material) => !filter || material.course_id === filter);
+  const selectedMaterial = materials.find((material) => material.id === materialFilter);
   const displayed = bySource ? data.chapters : studyChapters(data);
   const groups = courses.flatMap((course) => {
     const chapters = displayed.filter((chapter) => chapter.course_id === course.id);
+    if (bySource && selectedMaterial) {
+      return selectedMaterial.course_id === course.id ? [{
+        id: selectedMaterial.id, title: selectedMaterial.name, source: materialLabels[selectedMaterial.category],
+        chapters: chapters.filter((chapter) => chapter.material_id === selectedMaterial.id),
+      }] : [];
+    }
     if (!bySource || !chapters.length) return [{ id: course.id, title: course.name, source: '', chapters }];
-    return data.materials.filter((material) => material.course_id === course.id)
+    return materials.filter((material) => material.course_id === course.id)
       .map((material) => ({
         id: material.id, title: material.name, source: materialLabels[material.category],
         chapters: chapters.filter((chapter) => chapter.material_id === material.id),
@@ -306,17 +346,32 @@ export function ChaptersPage({ ctx, initialCourse }: { ctx: Context; initialCour
       .sort((a, b) => Number(b.source === materialLabels.textbook) - Number(a.source === materialLabels.textbook));
   });
   return <div className="screen"><Heading kicker="CHAPTERS / 学习进度" title="章节学习" note="学习清单优先使用原课本，同名笔记可按资料查阅。"
-    action={data.courses.length > 1 && <select aria-label="按科目筛选" value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">全部科目</option>{data.courses.map((course) => <option key={course.id} value={course.id}>{course.name}</option>)}</select>} />
+    action={data.courses.length > 1 && <select aria-label="按科目筛选" value={filter} onChange={(event) => {
+      const course = event.target.value;
+      setFilter(course);
+      if (course && selectedMaterial?.course_id !== course) setMaterialFilter('');
+    }}><option value="">全部科目</option>{data.courses.map((course) => <option key={course.id} value={course.id}>{course.name}</option>)}</select>} />
     <div className="button-group" role="group" aria-label="章节查看方式">
       <button type="button" className={`btn ${bySource ? 'secondary' : 'primary'}`} aria-pressed={!bySource} onClick={() => setBySource(false)}>学习清单</button>
       <button type="button" className={`btn ${bySource ? 'primary' : 'secondary'}`} aria-pressed={bySource} onClick={() => setBySource(true)}>按资料查看</button>
     </div>
+    {bySource && <label className="chapter-material-filter">选择资料
+      <select value={selectedMaterial?.id ?? ''} onChange={(event) => setMaterialFilter(event.target.value)}>
+        <option value="">全部资料</option>
+        {materials.map((material) => <option key={material.id} value={material.id}>
+          {material.name} · {materialLabels[material.category]}
+        </option>)}
+      </select>
+    </label>}
     {groups.map(({ id, title, source, chapters }) => (
       <section className="card panel" key={id}><div className="panel-head"><div><h2>{title}</h2><p>{source && `${source} · `}{chapters.filter((chapter) => chapter.learned_at).length} / {chapters.length} 章已学</p></div></div>
         {chapters.length ? <ul className="record-list">{chapters.map((chapter, index) => <li key={chapter.id}><button className="record-row" onClick={() => go('chapter', chapter.id)}>
           <div className="record-icon chapter-index">{String(index + 1).padStart(2, '0')}</div><div><strong>{chapter.title}</strong><small>{!bySource && `${materialLabels[chapter.material_category]} · `}{chapter.question_count} 道练习 · 预计 {chapter.study_minutes + chapter.practice_minutes} 分钟</small></div>
           <span className={`pill ${chapter.learned_at ? 'green' : ''}`}>{chapter.practiced_at ? '已练习' : chapter.learned_at ? '已学' : '待学习'}</span><ChevronRight size={18} />
-        </button></li>)}</ul> : <Empty icon={<BookOpen size={25} />} title="这个科目还没有章节" note="先导入教材或讲义。" action={<button className="btn secondary" onClick={() => go('materials')}>打开资料库</button>} />}
+        </button></li>)}</ul> : <Empty icon={<BookOpen size={25} />}
+          title={source ? '这份资料还没有章节' : '这个科目还没有章节'}
+          note={source ? '可在资料详情查看导入状态或新建章节。' : '先导入教材或讲义。'}
+          action={<button className="btn secondary" onClick={() => source ? go('material', id) : go('materials')}>{source ? '打开资料' : '打开资料库'}</button>} />}
       </section>
     ))}
   </div>;
@@ -327,6 +382,7 @@ export function ChapterPage({ ctx, id }: { ctx: Context; id?: string }) {
   const currentJobs = [jobs.find((item) => item.kind === 'analyze'), jobs.find((item) => item.kind === 'generate')];
   const resource = useResource<ChapterDetail>(`${ctx.base}/chapters/${id}`, currentJobs.map((job) => `${job?.id}:${job?.status}`).join(','));
   const [editing, setEditing] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [draft, setDraft] = useState<Draft>();
   const [activeUnit, setActiveUnit] = useState<number>();
   const [questionCount, setQuestionCount] = useState(5);
@@ -345,7 +401,10 @@ export function ChapterPage({ ctx, id }: { ctx: Context; id?: string }) {
   });
   return <div className="screen"><button className="back" onClick={() => ctx.go('chapters')}><ArrowLeft size={17} /> 返回章节列表</button>
     <Heading kicker="CHAPTER / 章节工作区" title={chapter.title} note={`${ctx.data.courses.find((course) => course.id === chapter.course_id)?.name || ''} · ${materialLabels[chapter.material_category]} · ${chapter.material_name}`}
-      action={<button className="btn secondary" onClick={() => setEditing(true)}><PenLine size={16} /> 编辑章节</button>} />
+      action={<div className="button-group">
+        <button className="btn secondary" onClick={() => setEditing(true)}><PenLine size={16} /> 编辑章节</button>
+        <button className="btn delete-action" onClick={() => setDeleting(true)}><Trash2 size={16} /> 删除章节</button>
+      </div>} />
     <ErrorBox message={action.error} />
     <div className="split-layout reversed"><div className="stack"><section className="card panel">
       <div className="panel-head"><div><h2><Sparkles size={20} /> 章节分析</h2><p>摘要、知识点、复习重点与易混点</p></div>
@@ -366,7 +425,8 @@ export function ChapterPage({ ctx, id }: { ctx: Context; id?: string }) {
       </div>)}</div> : <Empty icon={<Sparkles size={24} />} title="等待生成章节分析" note={!chapter.units.length ? '本章没有原文片段，可在「编辑章节」中重新选择。' : ctx.aiReady ? '点击「分析本章」将本章校对后的文字发送至配置的模型。' : '在「服务配置」填写 AI 模型信息后，就可以根据原文生成分析。'} />}
     </section><section className="card panel"><div className="panel-head"><div><h2><BookOpen size={19} /> 章节原文</h2><p>{chapter.units.length ? '按原书编号连续阅读' : '暂无原文'}</p></div>
       <button className="btn secondary small" onClick={() => ctx.go('material', chapter.material_id)}><PenLine size={14} /> 校对资料</button></div>
-      {!!chapter.units.length && <ReadingFlow units={chapter.units} base={base} materialId={chapter.material_id} chapterTitle={chapter.title} activeUnit={activeUnit} />}
+      {!!chapter.units.length && <ReadingFlow units={chapter.units} base={base} materialId={chapter.material_id} chapterTitle={chapter.title}
+        activeUnit={activeUnit} progressKey={'/chapter/' + chapter.id} />}
     </section></div><aside className="stack"><section className="card panel stack chapter-tools"><div className="panel-head"><div><h2>本章练习</h2><p>{chapter.question_count} 道已加入的练习题</p></div></div>
       {chapter.learned_at ? <span className="pill green status-self"><Check size={14} /> 本章已学</span> : <button className="btn secondary" disabled={action.busy} onClick={() => void action.run(async () => {
         await api(`${base}/chapters/${chapter.id}/learn`, 'POST'); resource.reload(); await ctx.refresh(); ctx.notify('已标记本章学完');
@@ -382,6 +442,7 @@ export function ChapterPage({ ctx, id }: { ctx: Context; id?: string }) {
     {editing && <ChapterForm chapter={chapter} unitMin={chapter.unit_min} unitMax={chapter.unit_max} close={() => setEditing(false)} save={async (data) => {
       await api(`${base}/chapters/${chapter.id}`, 'PATCH', data); resource.reload(); await ctx.refresh(); setEditing(false); ctx.notify('章节已更新');
     }} />}
+    {deleting && <DeleteChapterDialog ctx={ctx} chapter={chapter} close={() => setDeleting(false)} />}
     {draft && <DraftEditor ctx={ctx} chapterId={chapter.id} existing={draft} close={() => setDraft(undefined)} saved={async () => { resource.reload(); await ctx.refresh(); setDraft(undefined); }} />}
   </div>;
 }
